@@ -2125,6 +2125,12 @@ def collect_new_entries(
                 name,
                 state
             ):
+                if add_source_to_story(
+                    entry,
+                    name,
+                    state
+                ):
+                    save_state(state)
                 continue
 
             candidates.append({
@@ -2421,7 +2427,7 @@ def main():
 
         test_duplicate_engine()
 
-    return
+        return
 
     # Test mode
     if args.test:
