@@ -1,2523 +1,1596 @@
+#!/usr/bin/env python3
+"""
+Anime News -> Discord Webhook Automation
+========================================
+
+Collects anime / manga / light-novel news from RSS feeds and posts compact,
+de-duplicated Discord embeds through a webhook.
+
+    python bot.py                   run continuously
+    python bot.py --once            run a single cycle and exit (cron friendly)
+    python bot.py --dry-run         run a cycle, print embeds, post nothing, save nothing
+    python bot.py --test            basic checks (config, feeds, sample embed)
+    python bot.py --test --send     ... and send one sample embed to Discord
+    python bot.py --test-media      media classification test
+    python bot.py --test-duplicates duplicate detection test
+
+Pipeline:
+    fetch -> clean -> classify -> extract (name/event/context/image)
+          -> posted-state filter -> duplicate clustering -> rank
+          -> post (max N per cycle) -> remember
+"""
+
+from __future__ import annotations
+
 import argparse
-import colorsys
+import calendar
 import difflib
 import html
 import json
+import logging
 import os
 import random
 import re
+import sys
 import time
+import unicodedata
+import warnings
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import feedparser
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
+warnings.filterwarnings("ignore", message=r"The input looks like")
+try:  # bs4 >= 4.11
+    from bs4 import XMLParsedAsHTMLWarning
 
-# ============================================================
-# Anime News → Discord
-# RSS feeds -> compact randomized Discord embeds
-# ============================================================
+    warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+except ImportError:  # pragma: no cover
+    pass
 
-load_dotenv()
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
-WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-FEEDS_FILE = "feeds.json"
-STATE_FILE = "posted.json"
+# Feeds are listed in priority order: when several sources report the same
+# story, the earlier feed wins. Verify URLs with `python bot.py --test`.
+RSS_FEEDS = [
+    {"name": "Anime News Network", "url": "https://www.animenewsnetwork.com/all/rss.xml?ann-edition=w"},
+    {"name": "Crunchyroll News", "url": "https://cr-news-api-service.prd.crunchyrollsvc.com/v1/en-US/rss"},
+    {"name": "MyAnimeList", "url": "https://myanimelist.net/rss/news.xml"},
+    {"name": "Anime Corner", "url": "https://animecorner.me/feed/"},
+]
 
-# Check every 15 minutes
-CHECK_INTERVAL_SECONDS = 15 * 60
 
-# Maximum number of NEW articles posted during one cycle
-MAX_POSTS_PER_CYCLE = 3
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
 
-# Number of recent RSS entries to inspect from each feed
-RSS_ITEMS_TO_SCAN = 12
 
-# First normal run seeds existing articles instead of flooding Discord.
-SEED_EXISTING_ON_FIRST_RUN = True
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
 
-# Optional Discord role mention.
-# Leave blank to disable.
-MENTION_ROLE_ID = os.getenv("DISCORD_ROLE_ID", "").strip()
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/140.0 Safari/537.36 AnimeNewsDiscord/1.0"
+MAX_POSTS_PER_CYCLE = _env_int("MAX_POSTS_PER_CYCLE", 3)
+CHECK_INTERVAL_MINUTES = max(1, _env_int("CHECK_INTERVAL_MINUTES", 15))
+MAX_ARTICLE_AGE_HOURS = _env_int("MAX_ARTICLE_AGE_HOURS", 48)
+FIRST_RUN_POST_LATEST = _env_int("FIRST_RUN_POST_LATEST", 0)  # 0 = seed only, post nothing
+ENABLE_OG_IMAGE = _env_bool("ENABLE_OG_IMAGE", True)
+REQUEST_TIMEOUT = 15
+POST_DELAY_SECONDS = 1.5
+
+POSTED_FILE = os.path.join(BASE_DIR, "posted.json")
+DUPLICATE_WINDOW_DAYS = 14  # compare against posted stories from this period
+STATE_RETENTION_DAYS = 60
+STATE_MAX_ENTRIES = 3000
+
+# Duplicate-detection thresholds
+SAME_STORY_SCORE = 0.85  # clearly the same story
+CONTEXT_SCORE = 0.71  # same story when contextual signals agree
+SAME_SOURCE_SCORE = 0.92  # two articles from ONE site must be near-identical
+
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+DISCORD_ROLE_ID = os.getenv("DISCORD_ROLE_ID", "").strip()
+WEBHOOK_RE = re.compile(r"^https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w-]+/?(?:\?.*)?$")
+
+USER_AGENT = "Mozilla/5.0 (compatible; AnimeNewsDiscordBot/1.0; +RSS reader)"
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": USER_AGENT})
+
+log = logging.getLogger("animebot")
+
+
+def redact(text) -> str:
+    """Never let the webhook URL leak into logs."""
+    text = str(text)
+    if DISCORD_WEBHOOK_URL:
+        text = text.replace(DISCORD_WEBHOOK_URL, "<webhook>")
+    return re.sub(r"(discord(?:app)?\.com/api/webhooks/\d+/)[\w-]+", r"\1<token>", text)
+
+
+# =============================================================================
+# DATA MODEL
+# =============================================================================
+
+
+@dataclass
+class Event:
+    key: str
+    label: str
+    priority: int  # lower = more important
+    dedup: tuple  # keys used for duplicate comparison
+    pos: int = 0
+    phrases: list = field(default_factory=list)
+
+
+@dataclass
+class Article:
+    title: str
+    link: str
+    source: str
+    description: str = ""
+    guid: str = ""
+    published: float = 0.0  # epoch seconds, 0 = unknown
+    image: str = ""
+    author: str = ""
+    source_rank: int = 0
+    # derived by analyze()
+    media: str = "Other"
+    scores: dict = field(default_factory=dict)
+    media_name: str = ""
+    season: str = ""
+    numbers: dict = field(default_factory=dict)
+    events: list = field(default_factory=list)
+    context: str = ""
+    sig: dict = field(default_factory=dict)
+
+
+# =============================================================================
+# TEXT / URL CLEANING
+# =============================================================================
+
+TRACKING_PARAMS = {
+    "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid", "igshid", "ref", "ref_src",
+    "cmpid", "cid", "source", "spm", "_hsenc", "_hsmi", "yclid", "twclid",
+}
+
+
+def clean_url(url) -> str:
+    url = (str(url) if url else "").strip()
+    if not url:
+        return ""
+    try:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https") or not p.netloc:
+            return ""
+        query = [
+            (k, v)
+            for k, v in parse_qsl(p.query, keep_blank_values=True)
+            if not (k.lower().startswith("utm_") or k.lower() in TRACKING_PARAMS)
+        ]
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(query), ""))
+    except ValueError:
+        return ""
+
+
+def link_key(url) -> str:
+    """Scheme/www/trailing-slash independent key for comparing links."""
+    u = clean_url(url)
+    if not u:
+        return ""
+    p = urlparse(u)
+    host = p.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return f"{host}{p.path.rstrip('/')}" + (f"?{p.query}" if p.query else "")
+
+
+def clean_text(raw) -> str:
+    """HTML -> readable single-line text."""
+    if not raw:
+        return ""
+    text = str(raw)
+    if "<" in text or "&" in text:
+        soup = BeautifulSoup(text, "html.parser")
+        for tag in soup(["script", "style", "iframe", "noscript"]):
+            tag.decompose()
+        text = soup.get_text(" ")
+    text = html.unescape(text).replace("\xa0", " ")
+    text = re.sub(r"The post .*? appeared first on .*?(?:\.|$)", "", text)
+    text = re.sub(r"\[(?:…|\.\.\.)\]", "", text)
+    text = re.sub(r"(?:Continue reading|Read more)\b.*$", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    return text
+
+
+def shorten(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    if " " in cut[limit // 2:]:
+        cut = cut[: cut.rfind(" ")]
+    return cut.rstrip(" ,;:-–—") + "…"
+
+
+def split_sentences(text: str) -> list:
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'“‘])", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+# =============================================================================
+# IMAGE HANDLING
+# =============================================================================
+
+BAD_IMAGE_HINTS = ("pixel", "1x1", "spacer", "blank.", "tracking", "beacon", "emoji", "favicon", "gravatar", "avatar")
+IMG_EXT_RE = re.compile(r"\.(?:jpe?g|png|webp|gif|avif)(?:$|\?)", re.I)
+
+
+def usable_image_url(url: str) -> bool:
+    if not url or not url.startswith(("http://", "https://")):
+        return False
+    low = url.lower()
+    if re.search(r"\.(?:svg|ico)(?:$|\?)", low):
+        return False
+    return not any(h in low for h in BAD_IMAGE_HINTS)
+
+
+def extract_image(entry, base_link: str) -> str:
+    cands = []
+    for m in entry.get("media_content", []) or []:
+        typ, medium = (m.get("type") or ""), (m.get("medium") or "")
+        if typ.startswith("video") or medium == "video":
+            continue
+        if m.get("url"):
+            cands.append(m["url"])
+    for m in entry.get("media_thumbnail", []) or []:
+        if m.get("url"):
+            cands.append(m["url"])
+    for l in (entry.get("links") or []) + (entry.get("enclosures") or []):
+        if l.get("rel") in (None, "enclosure") and (
+            (l.get("type") or "").startswith("image") or IMG_EXT_RE.search(l.get("href") or l.get("url") or "")
+        ):
+            cands.append(l.get("href") or l.get("url"))
+    blobs = [entry.get("summary", ""), entry.get("description", "")]
+    blobs += [c.get("value", "") for c in entry.get("content", []) or []]
+    for blob in blobs:
+        if blob and "<img" in blob:
+            try:
+                for img in BeautifulSoup(blob, "html.parser").find_all("img"):
+                    src = img.get("src") or img.get("data-src")
+                    if src:
+                        cands.append(src)
+            except Exception:  # noqa: BLE001
+                pass
+    for c in cands:
+        url = urljoin(base_link or "", html.unescape(str(c)).strip())
+        if usable_image_url(url):
+            return url
+    return ""
+
+
+def verify_image(url: str) -> bool:
+    """True only if the URL answers and serves an image."""
+    try:
+        r = SESSION.head(url, timeout=6, allow_redirects=True)
+        if r.status_code >= 400:
+            r = SESSION.get(url, timeout=6, stream=True)
+            r.close()
+        if r.status_code >= 400:
+            return False
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        return not ctype or ctype.startswith("image/") or "octet-stream" in ctype
+    except requests.RequestException:
+        return False
+
+
+def looks_like_challenge(text: str) -> bool:
+    low = text[:4000].lower()
+    return "just a moment" in low or "cf-chl" in low or "challenge-platform" in low or (
+        "attention required" in low and "cloudflare" in low
+    )
+
+
+def fetch_og_image(url: str) -> str:
+    """Best-effort Open Graph image lookup (only used for articles we are about to post)."""
+    try:
+        r = SESSION.get(url, timeout=8, stream=True)
+        if r.status_code != 200:
+            r.close()
+            return ""
+        data = b""
+        for chunk in r.iter_content(16384):
+            data += chunk
+            if len(data) > 250_000:
+                break
+        r.close()
+        text = data.decode(r.encoding or "utf-8", "ignore")
+        if looks_like_challenge(text):
+            return ""
+        soup = BeautifulSoup(text, "html.parser")
+        for attrs in ({"property": "og:image"}, {"name": "twitter:image"}, {"property": "og:image:url"}):
+            tag = soup.find("meta", attrs=attrs)
+            if tag and tag.get("content"):
+                img = urljoin(url, tag["content"].strip())
+                if usable_image_url(img):
+                    return img
+    except (requests.RequestException, ValueError):
+        pass
+    return ""
+
+
+def resolve_image(a: Article) -> str:
+    if a.image and verify_image(a.image):
+        return a.image
+    if ENABLE_OG_IMAGE:
+        og = fetch_og_image(a.link)
+        if og and verify_image(og):
+            return og
+    return ""
+
+
+# =============================================================================
+# FEED FETCHING
+# =============================================================================
+
+
+class FeedError(Exception):
+    pass
+
+
+def _feed_markers(head: str) -> bool:
+    return any(m in head for m in ("<rss", "<feed", "<rdf:rdf", "<channel"))
+
+
+def fetch_feed(feed: dict, rank: int = 0) -> list:
+    """Download one feed. Raises FeedError with a short reason on failure."""
+    headers = {"Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5"}
+    resp = None
+    last_err = ""
+    for attempt in range(2):
+        try:
+            resp = SESSION.get(feed["url"], headers=headers, timeout=REQUEST_TIMEOUT)
+            if resp.status_code < 500:
+                break
+            last_err = f"HTTP {resp.status_code}"
+        except requests.RequestException as e:
+            last_err = f"network error ({e.__class__.__name__})"
+            resp = None
+        time.sleep(2)
+    if resp is None:
+        raise FeedError(last_err or "no response")
+
+    body = resp.content
+    head = body[:4000].decode("utf-8", "ignore").lower()
+    if resp.headers.get("cf-mitigated") == "challenge" or (looks_like_challenge(head) and not _feed_markers(head)):
+        raise FeedError("Cloudflare challenge page instead of RSS - skipped (no bypass attempted)")
+    if resp.status_code >= 400:
+        raise FeedError(f"HTTP {resp.status_code}")
+    if not _feed_markers(head):
+        raise FeedError("response is not RSS/Atom XML")
+
+    parsed = feedparser.parse(body)
+    if not parsed.entries:
+        if parsed.get("bozo"):
+            raise FeedError("invalid RSS/XML")
+        return []
+
+    articles = []
+    for entry in parsed.entries:
+        try:
+            art = entry_to_article(entry, feed["name"], rank)
+            if art:
+                articles.append(art)
+        except Exception as e:  # noqa: BLE001 - one broken article must never kill the cycle
+            log.warning("[%s] skipped malformed article: %s", feed["name"], e.__class__.__name__)
+    return articles
+
+
+def entry_to_article(entry, source: str, rank: int):
+    title = clean_text(entry.get("title"))
+    link = clean_url(entry.get("link"))
+    if not title or not link:
+        return None
+    desc_raw = entry.get("summary") or entry.get("description") or ""
+    if not desc_raw and entry.get("content"):
+        desc_raw = entry["content"][0].get("value", "")
+    ts = entry.get("published_parsed") or entry.get("updated_parsed")
+    published = float(calendar.timegm(ts)) if ts else 0.0
+    return Article(
+        title=title,
+        link=link,
+        source=source,
+        description=clean_text(desc_raw),
+        guid=str(entry.get("id") or entry.get("guid") or "").strip(),
+        published=published,
+        image=extract_image(entry, link),
+        author=clean_text(entry.get("author")),
+        source_rank=rank,
+    )
+
+
+def collect_articles(feeds: list, quiet: bool = False):
+    """Fetch every feed independently. Returns (articles, per_feed_status)."""
+    all_articles, status = [], []
+    for rank, feed in enumerate(feeds):
+        try:
+            items = fetch_feed(feed, rank)
+            status.append((feed["name"], True, f"{len(items)} articles"))
+            all_articles.extend(items)
+        except FeedError as e:
+            status.append((feed["name"], False, str(e)))
+            log.warning("[%s] feed skipped: %s", feed["name"], e)
+        except Exception as e:  # noqa: BLE001
+            status.append((feed["name"], False, f"unexpected error: {e.__class__.__name__}"))
+            log.warning("[%s] unexpected feed error: %s", feed["name"], redact(e))
+    return all_articles, status
+
+
+# =============================================================================
+# MEDIA TYPE DETECTION (Anime / Manga / Novel / Other)
+# =============================================================================
+
+
+def _c(pattern: str, flags: int = re.I):
+    return re.compile(pattern, flags)
+
+
+ANIME_SIGNALS = [
+    (_c(r"\banime\b"), 3.0),
+    (_c(r"\btv anime\b"), 1.5),
+    (_c(r"\banime adaptation\b"), 1.0),
+    (_c(r"\b(?:season\s*\d+|\d+(?:st|nd|rd|th)\s+season|(?:final|second|third|fourth|new)\s+season)\b"), 3.0),
+    (_c(r"\bepisodes?\b"), 3.0),
+    (_c(r"\btrailers?\b"), 2.0),
+    (_c(r"\bteasers?\b"), 2.0),
+    (_c(r"\bpv\b|\bpromo(?:tional)? video\b"), 2.0),
+    (_c(r"\bkey visual\b"), 2.0),
+    (_c(r"\bvoice cast\b|\bvoice actors?\b|\bcasts?\b"), 2.0),
+    (_c(r"\bbroadcast\b|\bpremier(?:e|es|ing)\b|\bcour\b|\bsimulcast\b"), 2.0),
+    (_c(r"\b(?:opening|ending) (?:theme|song)s?\b|\btheme songs?\b"), 2.0),
+    (_c(r"\bstaff\b"), 1.5),
+    (_c(r"\bova\b|\boad\b|\banime (?:film|movie)\b"), 2.0),
+]
+MANGA_SIGNALS = [
+    (_c(r"\bmanga\b"), 3.0),
+    (_c(r"\bchapters?\b"), 3.0),
+    (_c(r"\bserializ(?:ed|ation|es|ing)\b"), 3.0),
+    (_c(r"\bvolumes?\b"), 1.0),
+    (_c(r"\btankobon\b"), 2.0),
+    (_c(r"\bmanga adaptation\b"), 1.0),
+    (_c(r"\bnew chapter\b"), 2.0),
+    (_c(r"\bmangaka\b"), 2.0),
+    (_c(r"\b(?:weekly )?sh[o]+nen jump\b|\bshounen\b"), 1.5),
+]
+NOVEL_SIGNALS = [
+    (_c(r"\blight novels?\b"), 4.0),
+    (_c(r"(?<!light )(?<!web )\bnovels?\b"), 2.0),
+    (_c(r"\bLNs?\b", 0), 3.0),
+    (_c(r"\bweb novels?\b"), 3.0),
+    (_c(r"\bnovel adaptation\b"), 2.0),
+    (_c(r"\bvolumes?\b"), 1.0),
+]
+
+# Event patterns that say what the news is ABOUT (as opposed to the source material).
+ANIME_ADAPT_RE = _c(
+    r"\b(?:gets?|getting|receives?|receiving)\s+(?:an?\s+|the\s+|new\s+|tv\s+|original\s+|television\s+)*anime\b"
+    r"(?!\s+(?:trailer|visual|key|pv|teaser|cast|staff|theme|song|opening|ending|video|poster|image|illustration))"
+    r"|\b(?:green-?lit|greenlights?|inspires?)\b.{0,30}\banime\b"
+    r"|\badapted into (?:an? )?(?:tv )?anime\b"
+    r"|\banime adaptation\b.{0,25}\b(?:announced|green-?lit|confirmed|revealed?)\b"
+    r"|\b(?:announces?|announced|confirms?|unveils?|reveals?)\s+(?:an?\s+|new\s+|tv\s+)*anime\s+(?:adaptation|series|project)\b"
+    r"|\btv anime\b.{0,15}\b(?:announced|green-?lit|confirmed)\b"
+)
+MANGA_ADAPT_RE = _c(
+    r"\b(?:gets?|getting|receives?|launches|inspires?)\s+(?:an?\s+|the\s+|new\s+)*manga"
+    r"(?:\s+(?:adaptation|spin-?off|sequel|series))?\b"
+    r"|\bmanga adaptation\b.{0,25}\b(?:announced|launches|confirmed|revealed?)\b"
+)
+NOVEL_ADAPT_RE = _c(
+    r"\b(?:gets?|getting|receives?|launches)\s+(?:an?\s+|the\s+|new\s+)*(?:light\s+)?novel"
+    r"(?:\s+(?:adaptation|spin-?off|sequel|series))?\b"
+    r"|\bnovel adaptation\b.{0,25}\b(?:announced|launches|confirmed|revealed?)\b"
+)
+CHAPTER_RE = _c(r"\bchapter\s*#?\d+\b|\bnew chapter\b")
+
+MEDIA_THRESHOLD = 2.0
+MEDIA_ORDER = ("Anime", "Manga", "Novel")
+
+
+def _strip_non_media(text: str) -> str:
+    """'Graphic novel' and 'visual novel' are not light novels."""
+    return re.sub(r"\b(?:graphic|visual) novels?\b", " ", text or "", flags=re.I)
+
+
+def _score(text: str, signals: list, weight: float = 1.0) -> float:
+    return sum(w * weight for rx, w in signals if rx.search(text))
+
+
+def classify_media(title: str, description: str = ""):
+    """Score-based classification. Returns (media_type, {'Anime':x,'Manga':y,'Novel':z})."""
+    t = _strip_non_media(title)
+    d = _strip_non_media((description or "")[:600])
+
+    scores = {
+        "Anime": _score(t, ANIME_SIGNALS) + _score(d, ANIME_SIGNALS, 0.3),
+        "Manga": _score(t, MANGA_SIGNALS) + _score(d, MANGA_SIGNALS, 0.3),
+        "Novel": _score(t, NOVEL_SIGNALS) + _score(d, NOVEL_SIGNALS, 0.3),
+    }
+
+    anime_adapt = bool(ANIME_ADAPT_RE.search(t))
+    chapter_event = bool(CHAPTER_RE.search(t))
+    manga_adapt = (not anime_adapt) and bool(MANGA_ADAPT_RE.search(t))
+    novel_adapt = (not anime_adapt) and bool(NOVEL_ADAPT_RE.search(t))
+
+    if anime_adapt:
+        scores["Anime"] += 5.0
+    if chapter_event:
+        scores["Manga"] += 5.0
+    if manga_adapt:
+        scores["Manga"] += 5.0
+    if novel_adapt:
+        scores["Novel"] += 5.0
+
+    # "Light Novel X Anime Reveals Voice Cast": 'light novel' only names the source
+    # material. If the headline carries anime signals and no manga/novel event,
+    # the source-medium words are discounted so they cannot override the anime event.
+    anime_in_title = _score(t, ANIME_SIGNALS) + (5.0 if anime_adapt else 0.0)
+    if anime_in_title >= 3.0 and not (chapter_event or manga_adapt or novel_adapt):
+        scores["Manga"] *= 0.5
+        scores["Novel"] *= 0.5
+
+    scores = {k: round(v, 2) for k, v in scores.items()}
+    best = max(MEDIA_ORDER, key=lambda m: (scores[m], -MEDIA_ORDER.index(m)))
+    return (best if scores[best] >= MEDIA_THRESHOLD else "Other"), scores
+
+
+# =============================================================================
+# TITLE / MEDIA NAME EXTRACTION
+# =============================================================================
+
+_VERBS = (
+    r"gets?|getting|reveals?|unveils?|announces?|announced|confirms?|confirmed|launch(?:es)?|streams?|streaming|"
+    r"streamed|premieres?|adds?|casts?|debuts?|ends?|concludes?|returns?|hits|sells|posts|previews?|delays?|"
+    r"delayed|teases?|shares?|lists?|reports?|ships?|opens?|inspires?|wins?|releases?|released|receives?|"
+    r"welcomes?|begins?|reaches|gains?|drops?|shows?|brings?|plans?|licenses?|licensed|acquires?|rescues?|sets|"
+    r"green-?lit|greenlights?|reaffirms?|promises|celebrates?|unleashes|kicks|"
+    r"to (?:get|stream|premiere|end|release|launch|air|debut|receive|return|add|conclude)"
+)
+BOUNDARY_RE = re.compile(r"\b(?:%s)\b" % _VERBS, re.I)
+QUOTE_RE = re.compile(r"[\"“‘]([^\"”’]{2,80})[\"”’]|(?<![\w])'([^']{2,80})'(?![\w])")
+LEADING_LABEL_RE = _c(r"^(?:interview|review|spoilers?|news|exclusive|breaking|update|rumou?r|report|poll|list|feature|editorial)\s*[:\-–|]\s*")
+MARKER_RE = _c(
+    r"\b(?:season\s*\d+|\d+(?:st|nd|rd|th)\s+season|(?:final|second|third|fourth)\s+season|part\s*\d+|cour\s*\d+|"
+    r"chapter\s*#?\d+|episode\s*#?\d+|volume\s*\d+|vol\.?\s*\d+)\b.*$"
+)
+TRAIL_RE = _c(r"\s+(?:tv|original|anime|film|movie|manga|light novels?|web novels?|novels?|series|adaptation|sequel|project|ova|oad|live-action|television)\s*$")
+LEAD_RE = _c(r"^(?:tv\s+anime|anime|manga|light novels?|web novels?|novels?|tv)\s+")
+_NUM_WORDS = {"second": 2, "third": 3, "fourth": 4}
+_STRIP_CHARS = " \t\"'“”‘’:-–—|,.;"
+
+
+def find_season(text: str) -> str:
+    m = re.search(
+        r"\b(?:season\s*(\d+)|(\d+)(?:st|nd|rd|th)\s+season|(final|second|third|fourth)\s+season)\b", text, re.I
+    )
+    if not m:
+        return ""
+    if m.group(1) or m.group(2):
+        return f"Season {m.group(1) or m.group(2)}"
+    word = m.group(3).lower()
+    return "Final Season" if word == "final" else f"Season {_NUM_WORDS[word]}"
+
+
+def _strip_descriptors(s: str) -> str:
+    s = s.strip(_STRIP_CHARS)
+    s = MARKER_RE.sub("", s).strip(_STRIP_CHARS)
+    for _ in range(6):
+        new = TRAIL_RE.sub("", s).strip(_STRIP_CHARS)
+        new = LEAD_RE.sub("", new).strip(_STRIP_CHARS)
+        if new == s:
+            break
+        s = new
+    return s
+
+
+def extract_media_name(title: str):
+    """Pull the work's actual name out of a news headline. Returns (name, season_label)."""
+    t = (title or "").strip()
+    season = find_season(t)
+
+    qm = QUOTE_RE.search(t)
+    if qm:
+        cand = _strip_descriptors(next(g for g in qm.groups() if g))
+        if cand:
+            return shorten(cand, 70), season
+
+    cut = t
+    for m in BOUNDARY_RE.finditer(t):
+        if m.start() > 0 and t[: m.start()].strip():
+            cut = t[: m.start()]
+            break
+    cut = LEADING_LABEL_RE.sub("", cut)
+    name = _strip_descriptors(cut)
+    if not name:
+        name = _strip_descriptors(re.split(r"[:\-–|,]", t)[0])
+    return shorten(name or t, 70), season
+
+
+# =============================================================================
+# EVENT DETECTION
+# =============================================================================
+
+
+def _date_label(t, media):
+    return "Premiere Date Announced" if media == "Anime" else "Release Date Announced"
+
+
+def _ending_label(t, media):
+    if re.search(r"\bto end\b|\bwill end\b|\bending (?:in|soon)\b|\bnearing\b", t, re.I):
+        return "Ending Announced"
+    return "Series Concludes"
+
+
+def _episode_label(t, media):
+    if re.search(r"\b(?:preview|synopsis|screenshots?|images?)\b", t, re.I):
+        return "Episode Preview Revealed"
+    return "New Episode Released"
+
+
+def _delay_label(t, media):
+    if re.search(r"hiatus|on break", t, re.I):
+        return "Hiatus Announced"
+    if re.search(r"cancel", t, re.I):
+        return "Cancellation Announced"
+    return "Delay Announced"
+
+
+def _anime_adapt_label(t, media):
+    return "TV Anime Adaptation Announced" if re.search(r"\btv anime\b", t, re.I) else "Anime Adaptation Announced"
+
+
+# (key, dedup_key, regex, priority, label function). Lower priority number = more important.
+EVENT_RULES = [
+    ("anime_film", "anime_film",
+     _c(r"\b(?:gets?|receives?|green-?lit|announces?|announced|confirm\w*)\b.{0,40}\banime (?:film|movie)\b"
+        r"|\banime (?:film|movie)\b.{0,20}\b(?:announced|green-?lit|confirmed)\b"),
+     1, lambda t, m: "Anime Film Announced"),
+    ("adaptation_anime", "adaptation", ANIME_ADAPT_RE, 1, _anime_adapt_label),
+    ("adaptation_manga", "adaptation", MANGA_ADAPT_RE, 1, lambda t, m: "Manga Adaptation Announced"),
+    ("adaptation_novel", "adaptation", NOVEL_ADAPT_RE, 1, lambda t, m: "Novel Adaptation Announced"),
+    ("new_season", "new_season",
+     _c(r"\b(?:gets?|receives?|renewed|announces?|announced|confirm\w*|green-?lit)\b.{0,30}\b(?:season|sequel|cour)\b"
+        r"|\b(?:season\s*\d+|\d+(?:st|nd|rd|th) season|final season|new season)\b.{0,25}\b(?:announced|confirmed|green-?lit|renewed)\b"),
+     2, lambda t, m: "New Season Announced"),
+    ("date", "date",
+     _c(r"\b(?:premieres?|debuts?|launches|airs?|broadcasts?)\s+(?:in|on|this)\b|\b(?:premiere|broadcast|release|air|launch|debut)\s+(?:date|window|month)\b"
+        r"|\bto premiere\b|\bpremiering\b|\bscheduled for\b"),
+     2, _date_label),
+    ("ending", "ending",
+     _c(r"\b(?:concludes?|to end|will end|ends|wraps? up|finale|final (?:chapter|volume|episode|arc))\b"),
+     2, _ending_label),
+    ("chapter", "chapter", _c(r"\bchapter\s*#?\d+\b|\bnew chapter\b"), 3, lambda t, m: "New Chapter Released"),
+    ("episode", "episode", _c(r"\bepisode\s*#?\d+\b|\bnew episode\b"), 3, _episode_label),
+    ("license", "license", _c(r"\b(?:licenses?|licensed|acquires?)\b"), 3, lambda t, m: "License Announced"),
+    ("streaming", "streaming", _c(r"\b(?:to stream|streams?|streaming|simulcast)\b"), 3, lambda t, m: "Streaming Announced"),
+    ("volume", "volume",
+     _c(r"\b(?:volume|vol\.?)\s*\d*\b.{0,30}\b(?:released?|ships?|out now|hits|arrives|sells)\b|\b(?:released?|ships?)\b.{0,20}\bvolume\b"),
+     3, lambda t, m: "New Volume Released"),
+    ("delay", "delay", _c(r"\b(?:delayed?|postponed?|hiatus|on break|cancel(?:s|led|ed)?)\b"), 3, _delay_label),
+    ("interview", "interview", _c(r"\binterview\b"), 5, lambda t, m: "Interview Published"),
+    ("sales", "sales", _c(r"\b(?:sales?|rankings?|box office|top \d+|sells|sold)\b"), 5, lambda t, m: "Rankings & Sales Update"),
+]
+
+REVEAL_PRIORITY = 4
+# (key, regex, noun used in label, phrase used in context)
+REVEAL_ITEMS = [
+    ("trailer", _c(r"\btrailers?\b"), "Trailer", "a new trailer"),
+    ("teaser", _c(r"\bteasers?\b"), "Teaser", "a teaser"),
+    ("pv", _c(r"\bpv\b|\bpromo(?:tional)? video\b"), "Promo Video", "a promo video"),
+    ("key_visual", _c(r"\b(?:key )?visuals?\b"), "Key Visual", "a key visual"),
+    ("poster", _c(r"\bposter\b"), "Poster", "a poster"),
+    ("staff", _c(r"\bstaff\b"), "Staff", "its staff"),
+    ("cast", _c(r"\b(?:voice )?cast\b|\bvoice actors?\b|\bcasts\b"), "Cast", "its cast"),
+    ("theme", _c(r"\b(?:opening|ending) (?:theme|song)s?\b|\btheme songs?\b"), "Theme Songs", "its theme songs"),
+]
+
+
+def _join_and(items: list) -> str:
+    if len(items) > 1 and items[0].startswith("its "):  # "its main staff and first key visual"
+        items = [items[0]] + [i[4:] if i.startswith("its ") else i for i in items[1:]]
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def detect_events(text: str, media: str) -> list:
+    """Return events sorted by importance (most important first)."""
+    if not text:
+        return []
+    found = []
+    for key, dedup, rx, prio, labeler in EVENT_RULES:
+        m = rx.search(text)
+        if m:
+            found.append(Event(key, labeler(text, media), prio, (dedup,), m.start()))
+
+    keys = {e.key for e in found}
+    if "anime_film" in keys or "adaptation_anime" in keys:  # anime events trump manga/novel adaptation guesses
+        found = [e for e in found if e.key not in ("adaptation_manga", "adaptation_novel")]
+    if "ending" in keys:  # "Concludes With 12th Volume" is not a volume release
+        found = [e for e in found if e.key != "volume"]
+
+    items = []
+    for key, rx, noun, phrase in REVEAL_ITEMS:
+        m = rx.search(text)
+        if not m:
+            continue
+        if key == "staff" and re.search(r"\bmain staff\b", text, re.I):
+            noun, phrase = "Main Staff", "its main staff"
+        if key == "key_visual" and re.search(r"\b(?:1st|first)\s+(?:key\s+)?visual", text, re.I):
+            phrase = "its first key visual"
+        items.append((m.start(), key, noun, phrase))
+    if items:
+        items.sort()
+        nouns = [i[2] for i in items][:3]
+        verb = "Announced" if [i[1] for i in items] == ["cast"] else "Revealed"
+        label = (nouns[0] if len(nouns) == 1 else ", ".join(nouns[:-1]) + " & " + nouns[-1]) + " " + verb
+        found.append(Event("reveal", label, REVEAL_PRIORITY, tuple(i[1] for i in items), items[0][0], [i[3] for i in items][:3]))
+
+    found.sort(key=lambda e: (e.priority, e.pos))
+    return found
+
+
+def event_line(events: list) -> str:
+    labels = []
+    for e in events[:2]:
+        if e.label not in labels and (not labels or e.priority <= REVEAL_PRIORITY):
+            labels.append(e.label)
+    return " • ".join(labels) if labels else "Latest Update"
+
+
+# =============================================================================
+# NUMBERS (chapter / episode / volume / season) - used to tell stories apart
+# =============================================================================
+
+
+def extract_numbers(title: str) -> dict:
+    nums = {}
+    for key, pat in (
+        ("chapter", r"\bchapter\s*#?(\d+)"),
+        ("episode", r"\bepisode\s*#?(\d+)|\bep\.?\s*#?(\d+)"),
+        ("volume", r"\bvolume\s*#?(\d+)|\bvol\.?\s*#?(\d+)|\b(\d+)(?:st|nd|rd|th)\s+volume"),
+    ):
+        m = re.search(pat, title, re.I)
+        if m:
+            nums[key] = next(g for g in m.groups() if g)
+    season = find_season(title)
+    if season:
+        nums["season"] = season.replace("Season ", "").lower()
+    return nums
+
+
+# =============================================================================
+# CONTEXT GENERATION
+# =============================================================================
+
+DATE_RE = re.compile(
+    r"\b((?:in|on|this)\s+(?:(?:early|mid|late)\s+)?(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?"
+    r"(?:\s+\d{1,2}(?:st|nd|rd|th)?)?(?:,?\s+\d{4})?|(?:spring|summer|fall|autumn|winter)(?:\s+\d{4})?|\d{4}))\b",
+    re.I,
+)
+JUNK_SENTENCE_RE = re.compile(
+    r"click|subscribe|read more|sponsored|©|https?://|source:|follow us|newsletter|comments?\b|appeared first", re.I
 )
 
-session = requests.Session()
-session.headers.update({"User-Agent": USER_AGENT})
+
+def find_date_phrase(a: Article) -> str:
+    for text in (a.title, a.description[:400]):
+        m = DATE_RE.search(text or "")
+        if m:
+            return m.group(1).strip()
+    return ""
 
 
-# ============================================================
-# LARGE RANDOM COLOR PALETTE
-# ============================================================
-
-def build_color_palette():
-    """
-    Generate hundreds of visually usable Discord colors.
-
-    120 hue positions × 4 saturation levels × 3 brightness levels
-    = 1440 possible colors.
-    """
-
-    palette = []
-
-    for hue in range(0, 360, 3):
-        for saturation in (0.72, 0.82, 0.92, 1.00):
-            for value in (0.72, 0.84, 0.96):
-
-                r, g, b = colorsys.hsv_to_rgb(
-                    hue / 360,
-                    saturation,
-                    value,
-                )
-
-                rgb = (
-                    (int(r * 255) << 16)
-                    | (int(g * 255) << 8)
-                    | int(b * 255)
-                )
-
-                palette.append(rgb)
-
-    return palette
+def _tokens(s: str) -> set:
+    return set(norm_text(s).split())
 
 
-EMBED_COLORS = build_color_palette()
+def _description_sentence(a: Article, used_text: str) -> str:
+    """One informative, non-redundant sentence from the RSS description, or ''."""
+    seen = _tokens(a.title + " " + used_text)
+    for s in split_sentences(a.description)[:3]:
+        if len(s) < 35 or JUNK_SENTENCE_RE.search(s):
+            continue
+        toks = _tokens(s)
+        if not toks or len(toks & seen) / len(toks) >= 0.7:
+            continue  # mostly repeats what we already say
+        return shorten(s, 200)
+    return ""
 
-last_color = None
+
+def _primary_sentence(a: Article, e: Event, name: str, subject: str, date_phrase: str) -> str:
+    n = a.numbers
+    low = a.title.lower()
+    k = e.key
+    anime = a.media == "Anime"
+    if k == "adaptation_anime":
+        thing = "a TV anime" if "tv anime" in low else "an anime adaptation"
+        src = "light novel " if "light novel" in low else ("manga " if re.search(r"\bmanga\b", low) else "")
+        return f"The {src}{name} is getting {thing}." if src else f"{name} is getting {thing}."
+    if k == "anime_film":
+        return f"{name} is getting an anime film."
+    if k == "adaptation_manga":
+        return f"{name} is getting a manga adaptation."
+    if k == "adaptation_novel":
+        return f"{name} is getting a novel adaptation."
+    if k == "new_season":
+        return f"{subject} has been announced." if a.season else f"A new season of {name} has been announced."
+    if k == "date":
+        if date_phrase:
+            return f"{subject} premieres {date_phrase}." if anime else f"{subject} is scheduled for release {date_phrase}."
+        return f"A {'premiere' if anime else 'release'} date has been announced for {subject}."
+    if k == "ending":
+        if e.label == "Ending Announced":
+            return f"{name} is coming to an end."
+        return f"{name} concludes with volume {n['volume']}." if n.get("volume") else f"{name} has concluded."
+    if k == "chapter":
+        if n.get("chapter"):
+            return f"{name} Chapter {n['chapter']} has been released, continuing the current manga storyline."
+        return f"A new chapter of {name} has been released."
+    if k == "episode":
+        ep = f" Episode {n['episode']}" if n.get("episode") else ""
+        if e.label == "Episode Preview Revealed":
+            return f"A preview for {subject}{ep} has been revealed."
+        return f"{subject}{ep} has been released." if ep else f"A new episode of {subject} has been released."
+    if k == "license":
+        return f"A new license has been announced for {name}."
+    if k == "streaming":
+        return f"Streaming details have been announced for {subject}."
+    if k == "volume":
+        return f"Volume {n['volume']} of {name} has been released." if n.get("volume") else f"A new volume of {name} has been released."
+    if k == "delay":
+        return {"Hiatus Announced": f"{name} is going on hiatus.",
+                "Cancellation Announced": f"{name} has been cancelled."}.get(e.label, f"{name} has been delayed.")
+    if k == "reveal":
+        verb = "announced" if e.dedup == ("cast",) else "revealed"
+        return f"{subject} has {verb} {_join_and(e.phrases)}."
+    return ""
 
 
-def random_embed_color():
-    """
-    Return a random color while preventing
-    the exact same color from appearing twice consecutively.
-    """
+def _secondary_sentence(a: Article, e: Event, date_phrase: str) -> str:
+    if e.key == "reveal":
+        return f"The latest announcement also reveals {_join_and(e.phrases)}."
+    if e.key == "date":
+        if date_phrase and a.media == "Anime":
+            return f"It premieres {date_phrase}."
+        return f"A {'premiere' if a.media == 'Anime' else 'release'} date has also been announced."
+    if e.key == "new_season":
+        return "A new season has also been announced."
+    return ""
 
-    global last_color
 
-    choices = [
-        color
-        for color in EMBED_COLORS
-        if color != last_color
-    ]
+def build_context(a: Article) -> str:
+    """1-3 short factual sentences derived from the headline/description."""
+    name = a.media_name or shorten(a.title, 80)
+    subject = f"{name} {a.season}".strip() if a.season else name
+    date_phrase = find_date_phrase(a)
+    sentences = []
+    if a.events:
+        first = _primary_sentence(a, a.events[0], name, subject, date_phrase)
+        if first:
+            sentences.append(first)
+        for e in a.events[1:2]:
+            second = _secondary_sentence(a, e, date_phrase)
+            if second:
+                sentences.append(second)
+    if len(sentences) < 3:
+        extra = _description_sentence(a, " ".join(sentences))
+        if extra and (len(sentences) < 2 or len(" ".join(sentences)) < 160):
+            sentences.append(extra)
+    if not sentences:
+        sentences.append(shorten(a.title, 220))
+    return shorten(" ".join(sentences), 420)
 
-    color = random.choice(choices)
 
-    last_color = color
+# =============================================================================
+# SMART DUPLICATE DETECTION
+# =============================================================================
 
+_NOISE_WORDS = (
+    "the a an and for in on with its it is are was to of at by from as gets get getting receives receive reveals "
+    "reveal revealed unveils unveil unveiled announces announce announced confirms confirmed launches launch "
+    "released releases shows shares debuts new tv anime manga light novel novels adaptation series season part "
+    "cour chapter episode volume vol official officially first second final main"
+).split()
+
+
+def norm_text(s: str) -> str:
+    """Lower-case, strip accents/quotes/punctuation, unify common romanization variants."""
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c)).casefold()
+    s = re.sub(r"['’`´]s\b", "", s)
+    s = re.sub(r"['’`´]", "", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    toks = []
+    for t in s.split():
+        if t == "wo":
+            t = "o"
+        toks.append(t.replace("ou", "o").replace("oo", "o").replace("uu", "u"))
+    return " ".join(toks)
+
+
+NOISE = {norm_text(w) for w in _NOISE_WORDS}
+
+
+def norm_entity(name: str) -> str:
+    return " ".join(t for t in norm_text(name).split() if t not in ("the", "a", "an"))
+
+
+def title_tokens(title: str, numbers: dict) -> list:
+    drop = {str(v).lower() for v in numbers.values()}
+    out = []
+    for t in norm_text(title).split():
+        if t in NOISE or t in drop or re.fullmatch(r"\d+(?:st|nd|rd|th)", t):
+            continue
+        out.append(t)
+    return out
+
+
+def make_signature(a: Article) -> dict:
+    return {
+        "title_norm": norm_text(a.title),
+        "entity": norm_entity(a.media_name),
+        "tokens": title_tokens(a.title, a.numbers),
+        "events": sorted({k for e in a.events for k in e.dedup}),
+        "numbers": a.numbers,
+        "source": a.source,
+        "link": a.link,
+        "guid": a.guid,
+    }
+
+
+def entity_similarity(ea: str, eb: str) -> float:
+    if not ea or not eb:
+        return 0.0
+    if ea == eb:
+        return 1.0
+    ratio = difflib.SequenceMatcher(None, ea, eb).ratio()
+    ta, tb = set(ea.split()), set(eb.split())
+    small, big = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if small and small <= big and (len(small) >= 2 or len(" ".join(small)) >= 5):
+        ratio = max(ratio, 0.92)  # one name is contained in the other (subtitle differences)
+    return ratio
+
+
+def token_similarity(ta: list, tb: list) -> float:
+    sa, sb = set(ta), set(tb)
+    if not sa or not sb:
+        return 0.0
+    jac = len(sa & sb) / len(sa | sb)
+    seq = difflib.SequenceMatcher(None, " ".join(ta), " ".join(tb)).ratio()
+    return 0.5 * jac + 0.5 * seq
+
+
+def event_similarity(ea: set, eb: set) -> float:
+    if not ea and not eb:
+        return 0.6  # nothing to compare: neutral
+    if not ea or not eb:
+        return 0.3
+    return len(ea & eb) / len(ea | eb)
+
+
+def same_story(a: dict, b: dict):
+    """Compare two signatures. Returns (is_same_story, score)."""
+    la, lb = link_key(a.get("link")), link_key(b.get("link"))
+    if la and la == lb:
+        return True, 1.0
+    if a.get("guid") and a.get("guid") == b.get("guid"):
+        return True, 1.0
+    na, nb = a.get("title_norm", ""), b.get("title_norm", "")
+    if na and na == nb:
+        return True, 1.0
+
+    e = entity_similarity(a.get("entity", ""), b.get("entity", ""))
+    t = token_similarity(a.get("tokens", []), b.get("tokens", []))
+    eva, evb = set(a.get("events", [])), set(b.get("events", []))
+    ev = event_similarity(eva, evb)
+    score = round((0.5 * e + 0.3 * t + 0.2 * ev) if e > 0 else (0.8 * t + 0.2 * ev), 3)
+
+    # Different chapter/episode/season/volume number = different story.
+    numa, numb = a.get("numbers", {}), b.get("numbers", {})
+    if any(numa[k] != numb[k] for k in set(numa) & set(numb)):
+        return False, score
+
+    same_src = a.get("source") == b.get("source")
+    if score >= (SAME_SOURCE_SCORE if same_src else SAME_STORY_SCORE):
+        return True, score
+    if not same_src and score >= CONTEXT_SCORE and e >= 0.9 and (eva & evb):
+        return True, score
+    return False, score
+
+
+def cluster_articles(articles: list) -> list:
+    """Group same-story articles (transitively). Each cluster's first item is the best representative."""
+    n = len(articles)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if same_story(articles[i].sig, articles[j].sig)[0]:
+                parent[find(i)] = find(j)
+
+    groups = {}
+    for i, art in enumerate(articles):
+        groups.setdefault(find(i), []).append(art)
+    clusters = []
+    for members in groups.values():
+        members.sort(key=lambda x: (x.source_rank, not x.image, -len(x.description)))
+        clusters.append(members)
+    return clusters
+
+
+# =============================================================================
+# ANALYSIS PIPELINE
+# =============================================================================
+
+
+def analyze(a: Article) -> Article:
+    a.media, a.scores = classify_media(a.title, a.description)
+    a.media_name, a.season = extract_media_name(a.title)
+    a.numbers = extract_numbers(a.title)
+    a.events = detect_events(a.title, a.media) or detect_events(a.description[:300], a.media)
+    a.context = build_context(a)
+    a.sig = make_signature(a)
+    return a
+
+
+def analyze_all(articles: list) -> list:
+    out = []
+    for a in articles:
+        try:
+            out.append(analyze(a))
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not analyze '%s': %s", shorten(a.title, 50), e.__class__.__name__)
+    return out
+
+
+# =============================================================================
+# POSTED STATE (posted.json)
+# =============================================================================
+
+
+class State:
+    """Persistent memory of posted articles."""
+
+    def __init__(self, path: str = POSTED_FILE):
+        self.path = path
+        self.entries: list = []
+        self.first_run = True
+        self._links: set = set()
+        self._guids: set = set()
+        self._load()
+
+    # -- persistence ---------------------------------------------------------
+    def _load(self) -> None:
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as e:
+            backup = self.path + ".corrupt"
+            try:
+                os.replace(self.path, backup)
+            except OSError:
+                pass
+            log.warning("posted.json unreadable (%s) - moved to %s, re-seeding to avoid flooding", e.__class__.__name__, backup)
+            return
+
+        seeded = None
+        if isinstance(data, dict):
+            raw = data.get("entries") or data.get("posted") or []
+            seeded = data.get("seeded")
+        elif isinstance(data, list):
+            raw = data
+        else:
+            raw = []
+        for item in raw:
+            entry = self._coerce(item)
+            if entry:
+                self.entries.append(entry)
+        self.first_run = not (seeded if seeded is not None else bool(self.entries))
+        self._reindex()
+
+    @staticmethod
+    def _coerce(item):
+        """Accept entries from older/simpler formats (plain URL / GUID strings)."""
+        if isinstance(item, str):
+            item = item.strip()
+            if not item:
+                return None
+            return {"link": item, "guid": "", "ts": 0.0} if item.startswith("http") else {"link": "", "guid": item, "ts": 0.0}
+        if isinstance(item, dict):
+            item.setdefault("ts", 0.0)
+            return item
+        return None
+
+    def _reindex(self) -> None:
+        self._links = {link_key(e.get("link")) for e in self.entries if e.get("link")}
+        self._guids = {e["guid"] for e in self.entries if e.get("guid")}
+
+    def prune(self) -> None:
+        cutoff = time.time() - STATE_RETENTION_DAYS * 86400
+        kept = [e for e in self.entries if not e.get("ts") or e["ts"] >= cutoff]
+        self.entries = kept[-STATE_MAX_ENTRIES:]
+        self._reindex()
+
+    def save(self) -> None:
+        self.prune()
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"version": 2, "seeded": True, "entries": self.entries}, fh, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp, self.path)
+            self.first_run = False
+        except OSError as e:
+            log.error("could not save posted.json: %s", e)
+
+    # -- API -------------------------------------------------------------------
+    def already_posted(self, sig: dict) -> bool:
+        if link_key(sig.get("link")) in self._links or (sig.get("guid") and sig["guid"] in self._guids):
+            return True
+        cutoff = time.time() - DUPLICATE_WINDOW_DAYS * 86400
+        for e in self.entries:
+            if e.get("title_norm") and e.get("ts", 0) >= cutoff and same_story(sig, e)[0]:
+                return True
+        return False
+
+    def remember_entry(self, a: Article, seeded: bool = False) -> None:
+        entry = dict(a.sig)
+        entry.update({"media": a.media, "name": a.media_name, "ts": time.time(), "seeded": seeded})
+        self.entries.append(entry)
+        if entry.get("link"):
+            self._links.add(link_key(entry["link"]))
+        if entry.get("guid"):
+            self._guids.add(entry["guid"])
+
+
+# =============================================================================
+# DISCORD EMBEDS & WEBHOOK
+# =============================================================================
+
+COLOR_PALETTE = [
+    # purple / violet
+    0x8E44AD, 0x9B59B6, 0x7D3C98, 0xA569BD, 0x6C3483, 0x8A2BE2, 0x9370DB, 0x7B68EE, 0xB57EDC,
+    # magenta / pink
+    0xD81B60, 0xC2185B, 0xE91E8C, 0xBA2D9C, 0xFF69B4, 0xF06292, 0xFF8FB1, 0xEC7FA9,
+    # blue / cyan / teal
+    0x3498DB, 0x2E86DE, 0x1E90FF, 0x4A90E2, 0x5DADE2, 0x00BCD4, 0x26C6DA, 0x00ACC1, 0x87CEEB,
+    0x1ABC9C, 0x16A085, 0x009688, 0x26A69A, 0x3EB489,
+    # green / lime
+    0x2ECC71, 0x27AE60, 0x43A047, 0x66BB6A, 0x9ACD32, 0xAFD835, 0xC0CA33, 0xB5E61D,
+    # yellow / gold / orange
+    0xF1C40F, 0xF9E04B, 0xFFC107, 0xE6B800, 0xD4AF37, 0xE67E22, 0xFF9800, 0xFB8C00, 0xF39C12,
+    # red / crimson / coral
+    0xE74C3C, 0xF44336, 0xD32F2F, 0xFF5252, 0xDC143C, 0xB71C1C, 0xC62828, 0xFF7F50, 0xFF6F61, 0xFA8072,
+    # indigo
+    0x3F51B5, 0x5C6BC0, 0x303F9F, 0x4B6CC1,
+]
+_last_color = None
+
+
+def random_color() -> int:
+    global _last_color
+    color = random.choice([c for c in COLOR_PALETTE if c != _last_color])
+    _last_color = color
     return color
 
 
-# ============================================================
-# FILES / STATE
-# ============================================================
-
-def load_feeds():
-    with open(FEEDS_FILE, "r", encoding="utf-8") as file:
-        return json.load(file)
-
-
-def load_state():
-
-    if not os.path.exists(STATE_FILE):
-        return {
-            "initialized": False,
-            "posted": {},
-        }
-
-    try:
-
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            state = json.load(file)
-
-        # Backwards compatibility with old simple posted.json
-        if isinstance(state, list):
-
-            return {
-                "initialized": True,
-                "posted": {
-                    str(item): {
-                        "title": "",
-                        "source": "",
-                    }
-                    for item in state
-                },
-            }
-
-        state.setdefault(
-            "initialized",
-            False
-        )
-
-        state.setdefault(
-            "posted",
-            {}
-        )
-
-        return state
-
-    except (
-        json.JSONDecodeError,
-        OSError
-    ):
-
-        return {
-            "initialized": False,
-            "posted": {},
-        }
-
-
-def save_state(state):
-
-    # Keep the state file from becoming huge.
-    posted_items = list(
-        state.get("posted", {}).items()
-    )[-1000:]
-
-    state["posted"] = dict(posted_items)
-
-    with open(
-        STATE_FILE,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        json.dump(
-            state,
-            file,
-            indent=2,
-            ensure_ascii=False
-        )
-
-
-# ============================================================
-# TEXT CLEANING
-# ============================================================
-
-def clean_html_text(value):
-
-    if not value:
-        return ""
-
-    soup = BeautifulSoup(
-        value,
-        "html.parser"
-    )
-
-    # Remove scripts and styles
-    for tag in soup(
-        ["script", "style"]
-    ):
-        tag.decompose()
-
-    text = soup.get_text(
-        " ",
-        strip=True
-    )
-
-    # Decode:
-    # &hellip;
-    # &amp;
-    # &nbsp;
-    # etc.
-    text = html.unescape(text)
-
-    # Normalize whitespace
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    )
-
-    # Remove common RSS leftovers
-    text = text.replace(
-        "Read more",
-        ""
-    ).strip()
-
-    return text
-
-
-def shorten(text, limit=280):
-
-    text = clean_html_text(text)
-
-    if len(text) <= limit:
-        return text
-
-    candidate = text[:limit]
-
-    # Prefer sentence boundary
-    last_stop = max(
-        candidate.rfind(". "),
-        candidate.rfind("! "),
-        candidate.rfind("? "),
-    )
-
-    if last_stop >= int(
-        limit * 0.55
-    ):
-
-        return candidate[
-            :last_stop + 1
-        ]
-
-    return (
-        candidate
-        .rsplit(" ", 1)[0]
-        .rstrip(".,;:")
-        + "…"
-    )
-
-
-# ============================================================
-# IMAGE EXTRACTION
-# ============================================================
-
-def get_entry_image(entry):
-
-    candidates = []
-
-    # RSS media formats
-    for key in (
-        "media_content",
-        "media_thumbnail",
-    ):
-
-        values = entry.get(
-            key,
-            []
-        )
-
-        if isinstance(
-            values,
-            dict
-        ):
-            values = [values]
-
-        candidates.extend(
-            values or []
-        )
-
-    # RSS enclosure
-    enclosure = entry.get(
-        "enclosures",
-        []
-    )
-
-    if enclosure:
-        candidates.extend(
-            enclosure
-        )
-
-    # Find image URL
-    for item in candidates:
-
-        if not isinstance(
-            item,
-            dict
-        ):
-            continue
-
-        url = (
-            item.get("url")
-            or item.get("href")
-        )
-
-        mime = (
-            item.get("type")
-            or ""
-        ).lower()
-
-        if url and (
-            mime.startswith("image/")
-            or not mime
-        ):
-
-            return url
-
-    # Some feeds put image inside HTML
-    raw_html = (
-        entry.get(
-            "content",
-            [{}]
-        )[0].get(
-            "value",
-            ""
-        )
-        if entry.get("content")
-        else entry.get(
-            "summary",
-            ""
-        )
-    )
-
-    match = re.search(
-        r'<img[^>]+src=["\']([^"\']+)["\']',
-        raw_html,
-        re.I
-    )
-
-    if match:
-
-        return html.unescape(
-            match.group(1)
-        )
-
-    return None
-
-
-def get_og_image(article_url):
-
-    """
-    Fallback image extraction.
-
-    Some websites block automated requests,
-    so failure here is completely normal.
-    """
-
-    if not article_url:
-        return None
-
-    try:
-
-        response = session.get(
-            article_url,
-            timeout=8,
-            allow_redirects=True
-        )
-
-        if response.status_code != 200:
-            return None
-
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser"
-        )
-
-        for attrs in (
-            {"property": "og:image"},
-            {"name": "twitter:image"},
-        ):
-
-            tag = soup.find(
-                "meta",
-                attrs=attrs
-            )
-
-            if (
-                tag
-                and tag.get("content")
-            ):
-
-                return tag["content"]
-
-    except requests.RequestException:
-        pass
-
-    return None
-
-
-# ============================================================
-# MEDIA TYPE CLASSIFICATION
-# ============================================================
-
-def classify_type(
-    title,
-    description
-):
-
-    text = (
-        f"{title} {description}"
-        .lower()
-    )
-
-    # Strong novel signal
-    if re.search(
-        r"\blight novel\b|\bnovel\b",
-        text
-    ):
-
-        return "Novel"
-
-    # Strong manga signal
-    if re.search(
-        r"\bmanga\b|"
-        r"\bmanhwa\b|"
-        r"\bwebtoon\b|"
-        r"\bone[- ]shot\b",
-        text
-    ):
-
-        return "Manga"
-
-    # Anime signal
-    if re.search(
-        r"\banime\b|"
-        r"\bseason\b|"
-        r"\bcour\b|"
-        r"\bepisode\b|"
-        r"\btrailer\b|"
-        r"\bopening\b|"
-        r"\bending\b|"
-        r"\bvoice cast\b",
-        text
-    ):
-
-        return "Anime"
-
-    # Default
-    return "Anime"
-
-
-# ============================================================
-# NEWS TOPIC CLASSIFICATION
-# ============================================================
-
-TOPIC_RULES = [
-
-    (
-        "New Chapter",
-        [
-            r"\bchapter\b",
-            r"\bchapters\b",
-            r"\bone[- ]shot\b",
+MEDIA_LABELS = {"Anime": "ANIME", "Manga": "MANGA", "Novel": "LIGHT NOVEL", "Other": "NEWS"}
+
+
+def build_embed(a: Article) -> dict:
+    name = a.media_name or shorten(a.title, 120)
+    embed = {
+        "author": {"name": MEDIA_LABELS.get(a.media, "NEWS")},
+        "title": shorten(name, 250),
+        "url": a.link,
+        "description": f"{shorten(a.context, 700)}\n\n[Read Full Article]({a.link})",
+        "color": random_color(),
+        "fields": [
+            {"name": "Event", "value": shorten(event_line(a.events), 1000), "inline": False},
+            {"name": "Type", "value": a.media if a.media != "Other" else "General News", "inline": True},
+            {"name": "Source", "value": shorten(a.source, 200), "inline": True},
         ],
-    ),
-
-    (
-        "New Episode",
-        [
-            r"\bepisode\b",
-            r"\bpremiere\b",
-            r"\baired\b",
-            r"\bairs\b",
-            r"\bsimulcast\b",
-        ],
-    ),
-
-    (
-        "New Season",
-        [
-            r"\bseason\b",
-            r"\bcour\b",
-        ],
-    ),
-
-    (
-        "New Trailer",
-        [
-            r"\btrailer\b",
-            r"\bteaser\b",
-            r"\bpreview\b",
-        ],
-    ),
-
-    (
-        "Release Date",
-        [
-            r"\brelease date\b",
-            r"\bpremiere date\b",
-            r"\bset to release\b",
-            r"\bairs on\b",
-            r"\bairing on\b",
-        ],
-    ),
-
-    (
-        "New Volume",
-        [
-            r"\bvolume\b",
-            r"\bvol\.\b",
-        ],
-    ),
-
-    (
-        "Cast / Staff",
-        [
-            r"\bcast\b",
-            r"\bstaff\b",
-            r"\bvoices?\b",
-            r"\bvoice actor\b",
-            r"\bvoice actress\b",
-            r"\badds .* cast\b",
-        ],
-    ),
-
-    (
-        "New Visual",
-        [
-            r"\bvisual\b",
-            r"\bkey visual\b",
-            r"\billustration\b",
-        ],
-    ),
-
-    (
-        "New Opening / Ending",
-        [
-            r"\bopening\b",
-            r"\bending\b",
-            r"\bcreditless\b",
-            r"\btheme song\b",
-        ],
-    ),
-
-    (
-        "Adaptation",
-        [
-            r"\badaptation\b",
-            r"\bgets an anime\b",
-            r"\banime adaptation\b",
-        ],
-    ),
-
-    (
-        "Announcement",
-        [
-            r"\bannounc",
-            r"\bunveils?\b",
-            r"\breveals?\b",
-            r"\bconfirmed\b",
-            r"\bconfirms\b",
-        ],
-    ),
-
-    (
-        "Delay / Hiatus",
-        [
-            r"\bdelay",
-            r"\bdelayed\b",
-            r"\bpostpon",
-            r"\bhiatus\b",
-        ],
-    ),
-
-    (
-        "Ending",
-        [
-            r"\bends?\b",
-            r"\bending\b",
-            r"\bconcludes?\b",
-            r"\bfinal chapter\b",
-            r"\bfinal volume\b",
-        ],
-    ),
-]
-
-
-def classify_topic(
-    title,
-    description
-):
-
-    text = (
-        f"{title} {description}"
-        .lower()
-    )
-
-    for label, patterns in TOPIC_RULES:
-
-        for pattern in patterns:
-
-            if re.search(
-                pattern,
-                text
-            ):
-
-                return label
-
-    return "News"
-
-
-# ============================================================
-# SERIES / WORK NAME
-# ============================================================
-
-ACTION_WORDS = [
-
-    "announces",
-    "announced",
-
-    "reveals",
-    "revealed",
-
-    "releases",
-    "released",
-
-    "shares",
-    "shared",
-
-    "drops",
-    "dropped",
-
-    "confirms",
-    "confirmed",
-
-    "gets",
-    "receives",
-
-    "ends",
-    "ending",
-
-    "concludes",
-    "conclude",
-
-    "delays",
-    "delayed",
-
-    "postpones",
-    "postponed",
-
-    "casts",
-    "adds",
-
-    "introduces",
-
-    "unveils",
-    "unveiled",
-
-    "premieres",
-    "premiered",
-
-    "launches",
-
-    "returns",
-
-    "revealing",
-]
-
-
-def clean_series_name(name):
-
-    name = re.sub(
-        r"^\s*(new|latest|breaking)\s+",
-        "",
-        name,
-        flags=re.I
-    )
-
-    name = re.sub(
-        r"\s+\b(anime|manga|light novel|novel)\s*$",
-        "",
-        name,
-        flags=re.I
-    )
-
-    name = re.sub(
-        r"\s+",
-        " ",
-        name
-    )
-
-    name = name.strip(
-        " -:|,"
-    )
-
-    return name
-
-
-def extract_series_name(
-    title,
-    description=""
-):
-
-    title = clean_html_text(
-        title
-    )
-
-    # --------------------------------------------------------
-    # Quoted title
-    # --------------------------------------------------------
-
-    quoted = re.findall(
-        r"['“\"]([^'”\"]{3,100})['”\"]",
-        title
-    )
-
-    if quoted:
-
-        return clean_series_name(
-            max(
-                quoted,
-                key=len
-            )
-        )
-
-    # --------------------------------------------------------
-    # Split common separators
-    # --------------------------------------------------------
-
-    left = re.split(
-        r"\s+[—–:|]\s+",
-        title,
-        maxsplit=1
-    )[0].strip()
-
-    lowered = left.lower()
-
-    positions = []
-
-    for action in ACTION_WORDS:
-
-        match = re.search(
-            rf"\b{re.escape(action)}\b",
-            lowered
-        )
-
-        if match:
-            positions.append(
-                match.start()
-            )
-
-    if positions:
-
-        candidate = left[
-            :min(positions)
-        ].strip()
-
-        candidate = clean_series_name(
-            candidate
-        )
-
-        if 2 <= len(candidate) <= 90:
-
-            return candidate
-
-    # --------------------------------------------------------
-    # Remove generic framing
-    # --------------------------------------------------------
-
-    candidate = re.sub(
-        r"^(here(?:'s| is) "
-        r"(?:the )?"
-        r"(?:exact )?"
-        r"release date and time\s+)",
-        "",
-        title,
-        flags=re.I
-    )
-
-    candidate = re.sub(
-        r"^(new|latest)\s+",
-        "",
-        candidate,
-        flags=re.I
-    )
-
-    # --------------------------------------------------------
-    # Media marker
-    # --------------------------------------------------------
-
-    match = re.search(
-        r"\s+(anime|manga|light novel|novel)\b",
-        candidate,
-        flags=re.I
-    )
-
-    if match:
-
-        possible = candidate[
-            :match.start()
-        ].strip()
-
-        possible = clean_series_name(
-            possible
-        )
-
-        if 2 <= len(possible) <= 90:
-
-            return possible
-
-    # --------------------------------------------------------
-    # Final fallback
-    # --------------------------------------------------------
-
-    candidate = clean_series_name(
-        title
-    )
-
-    return shorten(
-        candidate,
-        80
-    )
-
-
-# ============================================================
-# SHORT CONTEXT
-# ============================================================
-
-def make_context(
-    title,
-    description,
-    topic,
-    media_type
-):
-
-    desc = clean_html_text(
-        description
-    )
-
-    title = clean_html_text(
-        title
-    )
-
-    # Prefer RSS description
-    if desc:
-
-        summary = shorten(
-            desc,
-            260
-        )
-
-    else:
-
-        summary = title
-
-    # Don't repeat title as description
-    if (
-        summary.lower().strip(". ")
-        == title.lower().strip(". ")
-    ):
-
-        summary = ""
-
-    # Fallback descriptions
-    if not summary:
-
-        if topic == "New Episode":
-
-            summary = (
-                "A new episode update "
-                "has been announced."
-            )
-
-        elif topic == "New Chapter":
-
-            summary = (
-                "A new chapter update "
-                "has been announced."
-            )
-
-        elif topic == "New Trailer":
-
-            summary = (
-                "A new trailer or preview "
-                "has been released."
-            )
-
-        elif topic == "Release Date":
-
-            summary = (
-                "A release-date update "
-                "has been announced."
-            )
-
-        else:
-
-            summary = (
-                "A new update has "
-                "been reported."
-            )
-
-    return summary
-
-
-# ============================================================
-# DATES
-# ============================================================
-
-def parse_entry_datetime(entry):
-
-    parsed = (
-        entry.get("published_parsed")
-        or entry.get("updated_parsed")
-    )
-
-    if parsed:
-
-        try:
-
-            return datetime(
-                parsed.tm_year,
-                parsed.tm_mon,
-                parsed.tm_mday,
-                parsed.tm_hour,
-                parsed.tm_min,
-                parsed.tm_sec,
-                tzinfo=timezone.utc,
-            )
-
-        except (
-            AttributeError,
-            ValueError
-        ):
-            pass
-
-    return datetime.now(
-        timezone.utc
-    )
-
-
-def format_datetime(dt):
-
-    # Discord understands ISO timestamps
-    # and renders them according to the
-    # viewer's locale.
-
-    return dt.isoformat()
-
-# ============================================================
-# SMART DUPLICATE DETECTION
-# ============================================================
-
-STOP_WORDS = {
-    "the",
-    "a",
-    "an",
-    "and",
-    "or",
-    "of",
-    "to",
-    "in",
-    "on",
-    "for",
-    "with",
-    "from",
-    "by",
-    "is",
-    "are",
-    "be",
-    "its",
-    "this",
-    "that",
-    "new",
-    "latest",
-    "official",
-    "reveals",
-    "revealed",
-    "announces",
-    "announced",
-    "confirms",
-    "confirmed",
-    "unveils",
-    "unveiled",
-    "shares",
-    "shared",
-    "gets",
-    "getting",
-    "release",
-    "released",
-    "news",
-}
-
-ROMANIZATION_REPLACEMENTS = {
-    "ā": "a",
-    "á": "a",
-    "à": "a",
-    "ä": "a",
-
-    "ē": "e",
-    "é": "e",
-    "è": "e",
-    "ë": "e",
-
-    "ī": "i",
-    "í": "i",
-    "ì": "i",
-    "ï": "i",
-
-    "ō": "o",
-    "ó": "o",
-    "ò": "o",
-    "ö": "o",
-
-    "ū": "u",
-    "ú": "u",
-    "ù": "u",
-    "ü": "u",
-}
-
-
-def normalize_romanization(text):
-    """
-    Normalize common romanized Japanese characters.
-
-    Example:
-        Hyōka -> Hyouka
-    """
-
-    text = text.lower()
-
-    for old, new in ROMANIZATION_REPLACEMENTS.items():
-        text = text.replace(old, new)
-
-    return text
-def normalize_title(title):
-
-    text = clean_html_text(
-        title
-    ).lower()
-    
-    text = normalize_romanization(
-        text
-    )
-
-    # Decode punctuation/entities
-    text = html.unescape(text)
-
-    # Normalize common punctuation
-    text = text.replace(
-        "’",
-        "'"
-    )
-    
-    # Normalize common spacing variations
-    text = re.sub(
-        r"\bno\s+da\s+ga\b",
-        "nodaga",
-        text
-    )
-
-    text = text.replace(
-        "–",
-        " "
-    )
-
-    text = text.replace(
-        "—",
-        " "
-    )
-
-    # Remove URLs
-    text = re.sub(
-        r"https?://\S+",
-        " ",
-        text
-    )
-
-    # Keep letters/numbers
-    text = re.sub(
-        r"[^a-z0-9\s]",
-        " ",
-        text
-    )
-
-    # Tokenize
-    tokens = text.split()
-
-    # Remove generic words
-    tokens = [
-        token
-        for token in tokens
-        if token not in STOP_WORDS
-    ]
-
-    return " ".join(tokens)
-
-
-def title_tokens(title):
-
-    normalized = normalize_title(
-        title
-    )
-
-    return set(
-        normalized.split()
-    )
-
-
-def token_similarity(
-    title_a,
-    title_b
-):
-
-    tokens_a = title_tokens(
-        title_a
-    )
-
-    tokens_b = title_tokens(
-        title_b
-    )
-
-    if not tokens_a or not tokens_b:
-        return 0.0
-
-    intersection = (
-        tokens_a & tokens_b
-    )
-
-    union = (
-        tokens_a | tokens_b
-    )
-
-    return (
-        len(intersection)
-        / len(union)
-    )
-
-
-def sequence_similarity(
-    title_a,
-    title_b
-):
-
-    normalized_a = normalize_title(
-        title_a
-    )
-
-    normalized_b = normalize_title(
-        title_b
-    )
-
-    if not normalized_a or not normalized_b:
-        return 0.0
-
-    return difflib.SequenceMatcher(
-        None,
-        normalized_a,
-        normalized_b
-    ).ratio()
-
-
-def extract_keywords(
-    title,
-    description=""
-):
-
-    text = (
-        f"{title} {description}"
-    )
-
-    normalized = normalize_title(
-        text
-    )
-
-    tokens = normalized.split()
-
-    # Remove very short words
-    tokens = [
-        token
-        for token in tokens
-        if len(token) >= 3
-    ]
-
-    return set(tokens)
-
-
-def keyword_similarity(
-    title_a,
-    description_a,
-    title_b,
-    description_b
-):
-
-    keywords_a = extract_keywords(
-        title_a,
-        description_a
-    )
-
-    keywords_b = extract_keywords(
-        title_b,
-        description_b
-    )
-
-    if not keywords_a or not keywords_b:
-        return 0.0
-
-    common = (
-        keywords_a & keywords_b
-    )
-
-    return (
-        len(common)
-        / max(
-            1,
-            min(
-                len(keywords_a),
-                len(keywords_b)
-            )
-        )
-    )
-
-
-def extract_story_identity(
-    title,
-    description=""
-):
-
-    """
-    Build a rough identity for the story.
-
-    Example:
-
-    The Apothecary Diaries Season 3
-    Reveals New Trailer
-
-    becomes roughly:
-
-    apothecary diaries season 3
-    """
-
-    normalized = normalize_title(
-        title
-    )
-
-    tokens = normalized.split()
-
-    # Important franchise/content tokens
-    important = []
-
-    media_words = {
-        "season",
-        "chapter",
-        "episode",
-        "volume",
-        "movie",
-        "film",
-        "trailer",
-        "visual",
-        "opening",
-        "ending",
-        "adaptation",
-        "anime",
-        "manga",
-        "novel",
+        "footer": {"text": a.source},
     }
-
-    for token in tokens:
-
-        if (
-            token in media_words
-            or len(token) >= 4
-        ):
-
-            important.append(
-                token
-            )
-
-    return " ".join(
-        important
-    )
+    if a.image:
+        embed["image"] = {"url": a.image}
+    if a.published and a.published <= time.time() + 300:
+        embed["timestamp"] = datetime.fromtimestamp(a.published, tz=timezone.utc).isoformat()
+    return embed
 
 
-def story_similarity(
-    entry_a,
-    entry_b
-):
+class WebhookInvalid(Exception):
+    """Webhook is missing/deleted/unauthorized - retrying is pointless."""
 
-    title_a = clean_html_text(
-        entry_a.get(
-            "title",
-            ""
-        )
-    )
 
-    title_b = clean_html_text(
-        entry_b.get(
-            "title",
-            ""
-        )
-    )
+def _retry_after(resp) -> float:
+    try:
+        return float(resp.json().get("retry_after"))
+    except (ValueError, TypeError, AttributeError):
+        pass
+    try:
+        return float(resp.headers.get("Retry-After", 2))
+    except ValueError:
+        return 2.0
 
-    description_a = clean_html_text(
-        entry_a.get(
-            "summary",
-            ""
-        )
-        or entry_a.get(
-            "description",
-            ""
-        )
-    )
 
-    description_b = clean_html_text(
-        entry_b.get(
-            "summary",
-            ""
-        )
-        or entry_b.get(
-            "description",
-            ""
-        )
-    )
+def send_webhook(embed: dict, mention_role: bool = False, retries: int = 3) -> bool:
+    """POST one embed. Handles rate limits, transient errors and invalid webhooks."""
+    payload = {"embeds": [embed], "allowed_mentions": {"parse": []}}  # never @everyone / @here
+    if mention_role and DISCORD_ROLE_ID.isdigit():
+        payload["content"] = f"<@&{DISCORD_ROLE_ID}>"
+        payload["allowed_mentions"] = {"parse": [], "roles": [DISCORD_ROLE_ID]}
 
-    if not title_a or not title_b:
-        return 0.0
+    for attempt in range(retries + 1):
+        try:
+            r = SESSION.post(DISCORD_WEBHOOK_URL, json=payload, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as e:
+            log.warning("Discord network error (%s), attempt %d", e.__class__.__name__, attempt + 1)
+            time.sleep(2 * (attempt + 1))
+            continue
+        if r.status_code in (200, 204):
+            return True
+        if r.status_code == 429:
+            wait = _retry_after(r)
+            log.warning("Discord rate limit: waiting %.1fs", wait)
+            if wait > 60:
+                return False
+            time.sleep(wait + 0.5)
+            continue
+        if r.status_code in (401, 403, 404):
+            raise WebhookInvalid(f"HTTP {r.status_code} - the webhook is invalid or was deleted. Create a new one and update .env")
+        if r.status_code >= 500:
+            time.sleep(2 * (attempt + 1))
+            continue
+        log.warning("Discord rejected the message (HTTP %s): %s", r.status_code, redact(r.text[:200]))
+        return False
+    return False
 
-    # --------------------------------------------------------
-    # 1. Token similarity
-    # --------------------------------------------------------
 
-    token_score = token_similarity(
-        title_a,
-        title_b
-    )
+# =============================================================================
+# CYCLE
+# =============================================================================
 
-    # --------------------------------------------------------
-    # 2. Sequence similarity
-    # --------------------------------------------------------
 
-    sequence_score = sequence_similarity(
-        title_a,
-        title_b
-    )
-
-    # --------------------------------------------------------
-    # 3. Keyword similarity
-    # --------------------------------------------------------
-
-    keyword_score = keyword_similarity(
-        title_a,
-        description_a,
-        title_b,
-        description_b
-    )
-
-    # --------------------------------------------------------
-    # 4. Story identity
-    # --------------------------------------------------------
-
-    identity_a = extract_story_identity(
-        title_a,
-        description_a
-    )
-
-    identity_b = extract_story_identity(
-        title_b,
-        description_b
-    )
-
-    identity_score = sequence_similarity(
-        identity_a,
-        identity_b
-    )
-
-    # --------------------------------------------------------
-    # Weighted score
-    # --------------------------------------------------------
-
-    score = (
-        token_score * 0.35
-        + sequence_score * 0.25
-        + keyword_score * 0.20
-        + identity_score * 0.20
-    )
-
+def rank_score(a: Article) -> float:
+    prio = min((e.priority for e in a.events), default=6)
+    score = 100.0 - prio * 10
+    if a.media == "Other":
+        score -= 15
+    if a.image:
+        score += 5
+    score -= a.source_rank * 1.5
+    if a.published:
+        age_h = max(0.0, (time.time() - a.published) / 3600)
+        score += max(0.0, 10 - age_h * 10 / max(MAX_ARTICLE_AGE_HOURS, 1))
     return score
 
 
-def same_story(
-    entry_a,
-    entry_b
-):
-
-    title_a = clean_html_text(
-        entry_a.get(
-            "title",
-            ""
-        )
-    )
-
-    title_b = clean_html_text(
-        entry_b.get(
-            "title",
-            ""
-        )
-    )
-
-    if not title_a or not title_b:
-        return False
-
-    # --------------------------------------------------------
-    # Calculate base similarity
-    # --------------------------------------------------------
-
-    score = story_similarity(
-        entry_a,
-        entry_b
-    )
-
-    # --------------------------------------------------------
-    # Strong direct match
-    # --------------------------------------------------------
-
-    if score >= 0.72:
+def is_fresh(a: Article) -> bool:
+    if not a.published or MAX_ARTICLE_AGE_HOURS <= 0:
         return True
-
-    # --------------------------------------------------------
-    # Very similar titles
-    # --------------------------------------------------------
-
-    title_score = sequence_similarity(
-        title_a,
-        title_b
-    )
-
-    if title_score >= 0.90:
-        return True
-
-    # --------------------------------------------------------
-    # Token overlap
-    # --------------------------------------------------------
-
-    tokens_a = title_tokens(
-        title_a
-    )
-
-    tokens_b = title_tokens(
-        title_b
-    )
-
-    if tokens_a and tokens_b:
-
-        common = (
-            tokens_a & tokens_b
-        )
-
-        smaller = min(
-            len(tokens_a),
-            len(tokens_b)
-        )
-
-        overlap = (
-            len(common) / smaller
-        )
-
-        # If most of the important words
-        # are shared, they're probably the
-        # same story.
-        if (
-            smaller >= 3
-            and overlap >= 0.75
-        ):
-            return True
-
-    # --------------------------------------------------------
-    # Series identity matching
-    # --------------------------------------------------------
-
-    identity_a = extract_story_identity(
-        title_a
-    )
-
-    identity_b = extract_story_identity(
-        title_b
-    )
-
-    if identity_a and identity_b:
-
-        identity_score = sequence_similarity(
-            identity_a,
-            identity_b
-        )
-
-        # Strong series identity + reasonable
-        # overall similarity.
-        if (
-            identity_score >= 0.85
-            and score >= 0.55
-        ):
-            return True
-
-    # --------------------------------------------------------
-    # Moderate similarity + strong keyword match
-    # --------------------------------------------------------
-
-    description_a = clean_html_text(
-        entry_a.get(
-            "summary",
-            ""
-        )
-        or entry_a.get(
-            "description",
-            ""
-        )
-    )
-
-    description_b = clean_html_text(
-        entry_b.get(
-            "summary",
-            ""
-        )
-        or entry_b.get(
-            "description",
-            ""
-        )
-    )
-
-    keyword_score = keyword_similarity(
-        title_a,
-        description_a,
-        title_b,
-        description_b
-    )
-
-    if (
-        score >= 0.58
-        and keyword_score >= 0.75
-    ):
-        return True
-
-    return False
-
-def already_posted(
-    entry,
-    source,
-    state
-):
-
-    link = entry.get(
-        "link",
-        ""
-    ).strip()
-
-    guid = entry.get(
-        "id",
-        ""
-    ).strip()
-
-    posted = state.get(
-        "posted",
-        {}
-    )
-
-    # --------------------------------------------------------
-    # Exact URL
-    # --------------------------------------------------------
-
-    if link and link in posted:
-        return True
-
-    # --------------------------------------------------------
-    # Exact RSS GUID
-    # --------------------------------------------------------
-
-    if guid and guid in posted:
-        return True
-
-    # --------------------------------------------------------
-    # Smart cross-feed duplicate detection
-    # --------------------------------------------------------
-
-    for item in posted.values():
-
-        old_entry = {
-            "title": item.get(
-                "title",
-                ""
-            ),
-            "summary": item.get(
-                "description",
-                ""
-            ),
-        }
-
-        if same_story(
-            entry,
-            old_entry
-        ):
-
-            return True
-
-    return False
-
-
-def find_matching_story(
-    entry,
-    state
-):
-
-    """
-    Returns the previously stored article
-    if this article appears to be the same story.
-
-    Otherwise returns None.
-    """
-
-    for key, item in state.get(
-        "posted",
-        {}
-    ).items():
-
-        old_entry = {
-            "title": item.get(
-                "title",
-                ""
-            ),
-            "summary": item.get(
-                "description",
-                ""
-            ),
-        }
-
-        if same_story(
-            entry,
-            old_entry
-        ):
-
-            return {
-                "key": key,
-                "data": item,
-            }
-
-    return None
-
-
-def remember_entry(
-    entry,
-    source,
-    state
-):
-
-    
-    key = (
-        entry.get("link")
-        or entry.get("id")
-        or normalize_title(
-            entry.get(
-                "title",
-                ""
-            )
-        )
-    )
-
-    state["posted"][key] = {
-
-        "title": clean_html_text(
-            entry.get(
-                "title",
-                ""
-            )
-        ),
-
-        "description": clean_html_text(
-            entry.get(
-                "summary",
-                ""
-            )
-            or entry.get(
-                "description",
-                ""
-            )
-        ),
-
-        "source": source,
-
-        "sources": [
-            source
-        ],
-
-        "link": entry.get(
-            "link",
-            ""
-        ),
-
-        "time": datetime.now(
-            timezone.utc
-        ).isoformat(),
-    }
-
-
-def add_source_to_story(
-    entry,
-    source,
-    state
-):
-
-    match = find_matching_story(
-        entry,
-        state
-    )
-
-    if not match:
-        return False
-
-    item = match["data"]
-
-    sources = item.setdefault(
-        "sources",
-        []
-    )
-
-    if source not in sources:
-
-        sources.append(
-            source
-        )
-
-    return True
-
-# ============================================================
-# DISCORD
-# ============================================================
-
-def send_embed(
-    entry,
-    source,
-    dry_run=False
-):
-
-    title = clean_html_text(
-        entry.get(
-            "title",
-            "Untitled"
-        )
-    )
-
-    link = entry.get(
-        "link",
-        ""
-    ).strip()
-
-    description = (
-        entry.get("summary")
-        or entry.get("description")
-        or ""
-    )
-
-    # Determine media type
-    media_type = classify_type(
-        title,
-        description
-    )
-
-    # Determine news topic
-    topic = classify_topic(
-        title,
-        description
-    )
-
-    # Determine anime/manga/novel name
-    series = extract_series_name(
-        title,
-        description
-    )
-
-    # Generate compact context
-    context = make_context(
-        title,
-        description,
-        topic,
-        media_type
-    )
-
-    # Get image
-    image_url = get_entry_image(
-        entry
-    )
-
-    # Website image fallback
-    if not image_url:
-
-        image_url = get_og_image(
-            link
-        )
-
-    published = parse_entry_datetime(
-        entry
-    )
-
-    # ========================================================
-    # DISCORD EMBED
-    # ========================================================
-
-    embed = {
-
-        # Anime / manga / novel name
-        "title": series[:256],
-
-        # Clicking title opens article
-        "url": link,
-
-        # Compact content
-        "description": (
-            f"**{media_type}**  •  **{topic}**\n\n"
-            f"{context}"
-        )[:4096],
-
-        # Random color
-        "color": random_embed_color(),
-
-        # Published timestamp
-        "timestamp": format_datetime(
-            published
-        ),
-
-        # Footer
-        "footer": {
-            "text": (
-                f"{source}  •  Anime News"
-            )
-        },
-
-        # Small metadata fields
-        "fields": [
-
-            {
-                "name": "Source",
-                "value": source,
-                "inline": True,
-            },
-
-            {
-                "name": "Type",
-                "value": media_type,
-                "inline": True,
-            },
-        ],
-    }
-
-    # Add article image
-    if image_url:
-
-        embed["image"] = {
-            "url": image_url
-        }
-
-    payload = {
-        "embeds": [
-            embed
-        ]
-    }
-
-    # Optional role mention
-    if MENTION_ROLE_ID:
-
-        payload["content"] = (
-            f"<@&{MENTION_ROLE_ID}>"
-        )
-
-        payload[
-            "allowed_mentions"
-        ] = {
-            "roles": [
-                MENTION_ROLE_ID
-            ]
-        }
-
-    # --------------------------------------------------------
-    # TEST / DEBUG
-    # --------------------------------------------------------
-
-    if dry_run:
-
-        print(
-            "\n--- TEST EMBED ---"
-        )
-
-        print(
-            json.dumps(
-                payload,
-                indent=2,
-                ensure_ascii=False
-            )
-        )
-
-        return True
-
-    # --------------------------------------------------------
-    # WEBHOOK CHECK
-    # --------------------------------------------------------
-
-    if not WEBHOOK_URL:
-
-        print(
-            "ERROR: "
-            "DISCORD_WEBHOOK_URL "
-            "is missing."
-        )
-
-        return False
-
-    # --------------------------------------------------------
-    # SEND TO DISCORD
-    # --------------------------------------------------------
-
-    try:
-
-        response = session.post(
-            WEBHOOK_URL,
-            json=payload,
-            timeout=20
-        )
-
-        if response.status_code in (
-            200,
-            204
-        ):
-
-            print(
-                f"Posted: {series} "
-                f"[{media_type} / {topic}]"
-            )
-
-            return True
-
-        print(
-            f"Discord error "
-            f"{response.status_code}: "
-            f"{response.text[:500]}"
-        )
-
-        return False
-
-    except requests.RequestException as error:
-
-        print(
-            f"Discord request failed: "
-            f"{error}"
-        )
-
-        return False
-
-
-# ============================================================
-# RSS FEED HANDLING
-# ============================================================
-
-def fetch_feed(feed):
-
-    name = feed["name"]
-    url = feed["url"]
-
-    try:
-
-        response = session.get(
-            url,
-            timeout=20
-        )
-
-        response.raise_for_status()
-
-        parsed = feedparser.parse(
-            response.content
-        )
-
-        if (
-            parsed.bozo
-            and not parsed.entries
-        ):
-
-            print(
-                f"[WARN] {name}: "
-                "invalid/blocked RSS feed."
-            )
-
-            return None
-
-        return parsed
-
-    except (
-        requests.RequestException,
-        ValueError
-    ) as error:
-
-        print(
-            f"[ERROR] {name}: "
-            f"{error}"
-        )
-
-        return None
-
-
-# ============================================================
-# FIRST RUN SEED
-# ============================================================
-
-def seed_existing_entries(
-    feeds,
-    state
-):
-
-    """
-    Mark existing RSS entries as known.
-
-    This prevents the first run from posting
-    12 old articles from every feed.
-    """
-
-    print(
-        "First run: "
-        "seeding existing RSS entries..."
-    )
-
-    for feed in feeds:
-
-        parsed = fetch_feed(
-            feed
-        )
-
-        if not parsed:
+    return (time.time() - a.published) <= MAX_ARTICLE_AGE_HOURS * 3600
+
+
+def banner(text: str) -> None:
+    print("=" * 40)
+    print(f" {text}")
+    print("=" * 40)
+
+
+def run_cycle(state: State, dry_run: bool = False) -> None:
+    banner("ANIME NEWS → DISCORD")
+    articles, status = collect_articles(RSS_FEEDS)
+    ok_feeds = sum(1 for _, ok, _ in status if ok)
+    print(f"\nFeeds: {len(RSS_FEEDS)} ({ok_feeds} reachable)")
+    for name, ok, note in status:
+        print(f"  {'✓' if ok else '✗'} {name}: {note}")
+
+    articles = analyze_all(articles)
+    print(f"Collected: {len(articles)}")
+
+    # --- first run: seed state, do not flood the channel ----------------------
+    if state.first_run and not dry_run:
+        articles.sort(key=lambda x: x.published, reverse=True)
+        keep = articles[:FIRST_RUN_POST_LATEST] if FIRST_RUN_POST_LATEST > 0 else []
+        keep_ids = {id(x) for x in keep}
+        for a in articles:
+            if id(a) not in keep_ids:
+                state.remember_entry(a, seeded=True)
+        state.save()
+        print(f"\nFirst run: remembered {len(articles) - len(keep)} existing articles without posting.")
+        if not keep:
+            print("Only new articles from now on will be posted.\nCycle complete.\n")
+            return
+        articles = keep
+
+    # --- filter posted / stale -----------------------------------------------
+    fresh = [a for a in articles if is_fresh(a)]
+    new = [a for a in fresh if not state.already_posted(a.sig)]
+    already = len(fresh) - len(new)
+
+    clusters = cluster_articles(new)
+    reps = [c[0] for c in clusters]
+    cluster_of = {id(c[0]): c for c in clusters}
+    dupes = len(new) - len(reps)
+
+    reps.sort(key=rank_score, reverse=True)
+    selected, seen_entities = [], set()
+    for a in reps:  # at most one story per franchise per cycle
+        ent = a.sig.get("entity")
+        if ent and ent in seen_entities:
             continue
+        selected.append(a)
+        if ent:
+            seen_entities.add(ent)
+        if len(selected) >= MAX_POSTS_PER_CYCLE:
+            break
 
-        entries = parsed.entries[
-            :RSS_ITEMS_TO_SCAN
-        ]
+    print(f"New candidates: {len(new)}")
+    print(f"Already posted/old: {already + len(articles) - len(fresh)}")
+    print(f"Duplicates removed: {dupes}")
+    print(f"Posts allowed: {min(len(selected), MAX_POSTS_PER_CYCLE)}\n")
 
-        for entry in entries:
+    if not selected:
+        print("Nothing new to post.\nCycle complete.\n")
+        return
 
-            remember_entry(
-                entry,
-                feed["name"],
-                state
-            )
-
-    state[
-        "initialized"
-    ] = True
-
-    save_state(
-        state
-    )
-
-    print(
-        "Seed complete. "
-        "Waiting for NEW articles."
-    )
-
-
-# ============================================================
-# COLLECT NEW ARTICLES
-# ============================================================
-
-def collect_new_entries(
-    feeds,
-    state
-):
-
-    candidates = []
-
-    for feed in feeds:
-
-        name = feed["name"]
-
-        print(
-            f"Checking: {name}"
-        )
-
-        parsed = fetch_feed(
-            feed
-        )
-
-        if not parsed:
+    print("Posting:" if not dry_run else "Dry run (nothing is sent or saved):")
+    sent = 0
+    for a in selected:
+        a.image = resolve_image(a)
+        embed = build_embed(a)
+        if dry_run:
+            print(f"- [{a.media}] {a.media_name} | {event_line(a.events)} | {a.source}")
+            print(f"    {a.context}")
+            print(f"    image: {a.image or '-'}")
             continue
+        try:
+            ok = send_webhook(embed, mention_role=(sent == 0))
+            if not ok and a.image:  # maybe the image broke it: retry without
+                embed.pop("image", None)
+                ok = send_webhook(embed, mention_role=(sent == 0))
+        except WebhookInvalid as e:
+            print(f"✗ {redact(e)}")
+            log.error("Stopping cycle: %s", redact(e))
+            break
+        if ok:
+            sent += 1
+            for member in cluster_of[id(a)]:  # also remember the other sources' versions
+                state.remember_entry(member)
+            state.save()
+            print(f"✓ {a.media_name}")
+            time.sleep(POST_DELAY_SECONDS)
+        else:
+            print(f"✗ {a.media_name} (will retry next cycle)")
+    print("\nCycle complete.\n")
 
-        entries = parsed.entries[
-            :RSS_ITEMS_TO_SCAN
-        ]
 
-        for entry in entries:
+# =============================================================================
+# TEST MODES
+# =============================================================================
 
-            if already_posted(
-                entry,
-                name,
-                state
-            ):
-                if add_source_to_story(
-                    entry,
-                    name,
-                    state
-                ):
-                    save_state(state)
+MEDIA_TEST_CASES = [
+    ("The Apothecary Diaries Season 3 Reveals New Trailer", "Anime"),
+    ("One Piece Chapter 1170 Released", "Manga"),
+    ("Some Light Novel Gets TV Anime", "Anime"),
+    ("Rebuild World TV Anime Reveals Main Staff", "Anime"),
+    ("Manga X Gets TV Anime Adaptation", "Anime"),
+    ("Frieren Season 2 Reveals Trailer", "Anime"),
+    ("Graphic Novel Gets Hardcover Release", "Other"),
+    ("Light Novel X Anime Reveals Voice Cast", "Anime"),
+    ("Light Novel X Concludes With 12th Volume", "Novel"),
+    ("Anime X Gets Manga Adaptation", "Manga"),
+]
+
+DUPLICATE_TEST_CASES = [
+    ("Anime News Network", "Rebuild World TV Anime Reveals Main Staff, 1st Key Visual",
+     "Crunchyroll News", "Rebuild World Anime Unveils Main Staff, Key Visual", True),
+    ("Anime News Network", "Rebuild World TV Anime Reveals Main Staff, 1st Key Visual",
+     "MyAnimeList", "'Rebuild World' Reveals Main Staff", True),
+    ("Anime Corner", "Delta to Gamma no Rigakubu Note Anime Adaptation Announced",
+     "Anime News Network", "Light Novel 'Delta to Gamma no Rigakubu Note' Gets TV Anime", True),
+    ("Anime News Network", "Tsukimichi Moonlit Fantasy Season 3 Reveals Trailer",
+     "MyAnimeList", "Tsukimichi -Moonlit Fantasy- Season 3 Unveils Trailer", True),
+    ("Anime News Network", "Youkoso Jitsuryoku Shijou Shugi no Kyoushitsu e Anime Reveals Trailer",
+     "Crunchyroll News", "Yokoso Jitsuryoku Shijo Shugi no Kyoshitsu e Anime Unveils Trailer", True),
+    ("Anime News Network", "Frieren Season 2 Reveals Trailer",
+     "Crunchyroll News", "Frieren Season 2 Reveals Main Staff", False),
+    ("Anime News Network", "Rebuild World TV Anime Reveals Main Staff, 1st Key Visual",
+     "Crunchyroll News", "Rebuild World Anime Unveils Trailer", False),
+    ("Anime News Network", "One Piece Chapter 1170 Released",
+     "MyAnimeList", "One Piece Chapter 1171 Released", False),
+    ("Anime News Network", "Frieren Season 2 Reveals Trailer",
+     "MyAnimeList", "Spy x Family Season 4 Reveals Trailer", False),
+]
+
+
+def _mk(title: str, source: str = "Test", desc: str = "", rank: int = 0) -> Article:
+    return analyze(Article(title=title, link=f"https://example.com/{abs(hash((title, source)))}", source=source,
+                           description=desc, source_rank=rank))
+
+
+def test_media() -> int:
+    banner("MEDIA DETECTION TEST")
+    print()
+    failures = 0
+    for title, expected in MEDIA_TEST_CASES:
+        media, sc = classify_media(title)
+        ok = media == expected
+        failures += not ok
+        print(f"{'OK  ' if ok else 'FAIL'} {media:<6} (expected {expected:<6}) "
+              f"A={sc['Anime']:<5} M={sc['Manga']:<5} N={sc['Novel']:<5} | {title}")
+    print(f"\n{len(MEDIA_TEST_CASES) - failures}/{len(MEDIA_TEST_CASES)} known cases passed.\n")
+
+    print("REAL FEED ARTICLES\n")
+    articles, status = collect_articles(RSS_FEEDS)
+    articles = analyze_all(articles)
+    if not articles:
+        print("(no feed articles available: " + "; ".join(f"{n}: {note}" for n, ok, note in status if not ok) + ")")
+    for name in dict.fromkeys(a.source for a in articles):
+        print(f"[{name}]")
+        for a in [x for x in articles if x.source == name][:12]:
+            print(f"{a.media:<6} | {shorten(a.media_name, 28):<28} | {shorten(a.title, 80)}")
+        print()
+    return 1 if failures else 0
+
+
+def test_duplicates() -> int:
+    banner("SMART DUPLICATE DETECTION TEST")
+    print("\nKNOWN CASES\n")
+    failures = 0
+    for src_a, title_a, src_b, title_b, expected in DUPLICATE_TEST_CASES:
+        a, b = _mk(title_a, src_a), _mk(title_b, src_b)
+        same, score = same_story(a.sig, b.sig)
+        ok = same == expected
+        failures += not ok
+        print(f"Score: {score:.2f}\n\n{src_a}:\n{title_a}\n\n{src_b}:\n{title_b}\n")
+        print(f"SAME STORY: {same}  (expected {expected})  {'OK' if ok else 'FAIL'}\n" + "-" * 40 + "\n")
+    print(f"{len(DUPLICATE_TEST_CASES) - failures}/{len(DUPLICATE_TEST_CASES)} known cases passed.\n")
+
+    print("REAL FEED ARTICLES\n")
+    articles, status = collect_articles(RSS_FEEDS)
+    articles = analyze_all(articles)
+    print(f"Collected {len(articles)} articles.\n")
+    pairs = []
+    for i in range(len(articles)):
+        for j in range(i + 1, len(articles)):
+            if articles[i].source == articles[j].source:
                 continue
-
-            candidates.append({
-
-                "entry": entry,
-
-                "source": name,
-
-                "published":
-                    parse_entry_datetime(
-                        entry
-                    ),
-            })
-
-    # Oldest first
-    candidates.sort(
-        key=lambda item:
-        item["published"]
-    )
-
-    return candidates
-
-
-# ============================================================
-# RUN ONE RSS CYCLE
-# ============================================================
-
-def run_cycle():
-
-    feeds = load_feeds()
-
-    state = load_state()
-
-    # First run
-    if (
-        not state["initialized"]
-        and SEED_EXISTING_ON_FIRST_RUN
-    ):
-
-        seed_existing_entries(
-            feeds,
-            state
-        )
-
-        return
-
-    # Find new articles
-    candidates = collect_new_entries(
-        feeds,
-        state
-    )
-
-    if not candidates:
-
-        print(
-            "No new articles."
-        )
-
-        return
-
-    posted_this_cycle = 0
-
-    for item in candidates:
-
-        # Respect posting limit
-        if (
-            posted_this_cycle
-            >= MAX_POSTS_PER_CYCLE
-        ):
-
-            print(
-                "Reached "
-                f"MAX_POSTS_PER_CYCLE="
-                f"{MAX_POSTS_PER_CYCLE}."
-            )
-
-            print(
-                "Remaining articles "
-                "stay for next cycle."
-            )
-
-            break
-
-        entry = item["entry"]
-
-        source = item["source"]
-
-        # Send
-        if send_embed(
-            entry,
-            source
-        ):
-
-            remember_entry(
-                entry,
-                source,
-                state
-            )
-
-            posted_this_cycle += 1
-
-            save_state(
-                state
-            )
-
-    # IMPORTANT:
-    # Articles not posted because of the limit
-    # are NOT marked as posted.
-
-
-# ============================================================
-# TEST MODE
-# ============================================================
-
-def test_latest():
-
-    feeds = load_feeds()
-
-    print(
-        "TEST MODE: "
-        "posting one latest article "
-        "per feed.\n"
-    )
-
-    for feed in feeds:
-
-        parsed = fetch_feed(
-            feed
-        )
-
-        if (
-            not parsed
-            or not parsed.entries
-        ):
-
-            print(
-                f"No entries: "
-                f"{feed['name']}"
-            )
-
-            continue
-
-        entry = parsed.entries[0]
-
-        send_embed(
-            entry,
-            feed["name"],
-            dry_run=False
-        )
-
-def test_duplicate_engine():
-
-    feeds = load_feeds()
-
-    state = load_state()
-
-    print(
-        "\n"
-        "========================================\n"
-        " SMART DUPLICATE DETECTION TEST\n"
-        "========================================\n"
-    )
-
-    all_entries = []
-
-    for feed in feeds:
-
-        parsed = fetch_feed(
-            feed
-        )
-
-        if not parsed:
-            continue
-
-        for entry in parsed.entries[:8]:
-
-            all_entries.append(
-                (
-                    feed["name"],
-                    entry
-                )
-            )
-
-    print(
-        f"Collected "
-        f"{len(all_entries)} articles.\n"
-    )
-
-    # Compare every article against
-    # every other article.
-    for i in range(
-        len(all_entries)
-    ):
-
-        source_a, entry_a = (
-            all_entries[i]
-        )
-
-        for j in range(
-            i + 1,
-            len(all_entries)
-        ):
-
-            source_b, entry_b = (
-                all_entries[j]
-            )
-
-            score = story_similarity(
-                entry_a,
-                entry_b
-            )
-
-            if score >= 0.50:
-
-                title_a = clean_html_text(
-                    entry_a.get(
-                        "title",
-                        ""
-                    )
-                )
-
-                title_b = clean_html_text(
-                    entry_b.get(
-                        "title",
-                        ""
-                    )
-                )
-
-                print(
-                    "\n----------------------------------------"
-                )
-
-                print(
-                    f"Score: {score:.2f}"
-                )
-
-                print(
-                    f"{source_a}:"
-                )
-
-                print(
-                    f"  {title_a}"
-                )
-
-                print(
-                    f"{source_b}:"
-                )
-
-                print(
-                    f"  {title_b}"
-                )
-
-                print(
-                    "SAME STORY:",
-                    same_story(
-                        entry_a,
-                        entry_b
-                    )
-                )
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Anime RSS → "
-            "Discord webhook bot"
-        )
-    )
-
-    parser.add_argument(
-        "--test",
-        action="store_true",
-        help=(
-            "Post the latest article "
-            "from each feed immediately."
-        ),
-    )
-    parser.add_argument(
-    "--test-duplicates",
-    action="store_true",
-    help=(
-        "Test smart duplicate detection "
-        "without posting to Discord."
-    ),
-)
-
-    args = parser.parse_args()
-    
+            same, score = same_story(articles[i].sig, articles[j].sig)
+            if same or score >= 0.55:
+                pairs.append((score, same, articles[i], articles[j]))
+    pairs.sort(key=lambda p: p[0], reverse=True)
+    if not pairs:
+        print("No related cross-source pairs found in the current feeds.")
+    for score, same, a, b in pairs[:15]:
+        print(f"Score: {score:.2f}\n\n{a.source}:\n{a.title}\n\n{b.source}:\n{b.title}\n\nSAME STORY: {same}\n")
+    return 1 if failures else 0
+
+
+def test_basic(send: bool) -> int:
+    banner("BASIC TEST")
+    print()
+    problems = 0
+    if DISCORD_WEBHOOK_URL:
+        valid = bool(WEBHOOK_RE.match(DISCORD_WEBHOOK_URL))
+        print(f"{'OK  ' if valid else 'WARN'} DISCORD_WEBHOOK_URL is set ({'format looks valid' if valid else 'format looks wrong'})")
+        problems += not valid
+    else:
+        print("WARN DISCORD_WEBHOOK_URL is not set (copy .env.example to .env)")
+        problems += 1
+    print(f"OK   DISCORD_ROLE_ID: {'set' if DISCORD_ROLE_ID.isdigit() else 'not set (no role mentions)'}")
+    st = State()
+    print(f"OK   posted.json: {len(st.entries)} entries, first run = {st.first_run}")
+
+    articles, status = collect_articles(RSS_FEEDS)
+    for name, ok, note in status:
+        print(f"{'OK  ' if ok else 'FAIL'} feed {name}: {note}")
+        problems += not ok
+    articles = analyze_all(articles)
+    sample = articles[0] if articles else _mk("Rebuild World TV Anime Reveals Main Staff, 1st Key Visual", "Sample Source",
+                                              "Sample description text for the preview.")
+    sample.image = sample.image if articles else ""
+    print("\nSample embed (NOT sent unless --send):\n")
+    print(json.dumps(build_embed(sample), indent=2, ensure_ascii=False))
+    if send:
+        if not WEBHOOK_RE.match(DISCORD_WEBHOOK_URL or ""):
+            print("\nCannot send: webhook URL missing/invalid.")
+            return 1
+        try:
+            ok = send_webhook(build_embed(sample))
+        except WebhookInvalid as e:
+            print(f"\nSend failed: {redact(e)}")
+            return 1
+        print(f"\nSample {'sent ✓' if ok else 'FAILED ✗'}")
+        problems += not ok
+    return 1 if problems else 0
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
+
+def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+
+    p = argparse.ArgumentParser(description="Anime/Manga/Novel news -> Discord webhook")
+    p.add_argument("--test", action="store_true", help="basic config/feed test (never posts unless --send)")
+    p.add_argument("--send", action="store_true", help="with --test: send one sample embed")
+    p.add_argument("--test-media", action="store_true", help="media classification test")
+    p.add_argument("--test-duplicates", action="store_true", help="duplicate detection test")
+    p.add_argument("--once", action="store_true", help="run one cycle and exit")
+    p.add_argument("--dry-run", action="store_true", help="run one cycle, print embeds, post/save nothing")
+    args = p.parse_args()
+
+    if args.test_media:
+        return test_media()
     if args.test_duplicates:
-
-        test_duplicate_engine()
-
-        return
-
-    # Test mode
+        return test_duplicates()
     if args.test:
+        return test_basic(args.send)
 
-        test_latest()
+    if not args.dry_run and not WEBHOOK_RE.match(DISCORD_WEBHOOK_URL):
+        print("ERROR: DISCORD_WEBHOOK_URL is missing or not a valid Discord webhook URL.\n"
+              "Copy .env.example to .env and paste your webhook URL there.")
+        return 1
 
-        return
+    state = State()
+    if args.dry_run:
+        run_cycle(state, dry_run=True)
+        return 0
 
-    # Startup information
-    print(
-        "=" * 50
-    )
-
-    print(
-        " Anime News → Discord"
-    )
-
-    print(
-        "=" * 50
-    )
-
-    print(
-        f"Feeds: "
-        f"{len(load_feeds())}"
-    )
-
-    print(
-        "Check interval: "
-        f"{CHECK_INTERVAL_SECONDS // 60} minutes"
-    )
-
-    print(
-        "Max posts/cycle: "
-        f"{MAX_POSTS_PER_CYCLE}"
-    )
-
-    print(
-        "Color palette: "
-        f"{len(EMBED_COLORS)} colors"
-    )
-
-    print(
-        "=" * 50
-    )
-
-    # Infinite loop
-    while True:
-
-        try:
-
-            print(
-                "\nChecking RSS feeds...\n"
-            )
-
-            run_cycle()
-
-        except KeyboardInterrupt:
-
-            print(
-                "\nStopped."
-            )
-
-            break
-
-        except Exception as error:
-
-            print(
-                "[UNEXPECTED ERROR] "
-                f"{error}"
-            )
-
-        print(
-            "\nNext check in "
-            f"{CHECK_INTERVAL_SECONDS // 60} minutes..."
-        )
-
-        try:
-
-            time.sleep(
-                CHECK_INTERVAL_SECONDS
-            )
-
-        except KeyboardInterrupt:
-
-            print(
-                "\nStopped."
-            )
-
-            break
+    try:
+        while True:
+            try:
+                run_cycle(state)
+            except Exception as e:  # noqa: BLE001 - keep the service alive
+                log.error("cycle failed: %s: %s", e.__class__.__name__, redact(e))
+            if args.once:
+                return 0
+            print(f"Next check in {CHECK_INTERVAL_MINUTES} minutes.\n")
+            time.sleep(CHECK_INTERVAL_MINUTES * 60)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

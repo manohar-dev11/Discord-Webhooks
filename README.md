@@ -1,247 +1,103 @@
 # Anime News → Discord
 
-A Python RSS bot that sends compact anime, manga and novel news
-to a Discord channel using a Discord webhook.
-
-## Features
-
-- 4 RSS feeds
-- One Discord webhook
-- 1400+ generated random colors
-- No identical color twice in a row
-- Compact mobile-friendly Discord embeds
-- Anime / Manga / Novel classification
-- New Episode detection
-- New Chapter detection
-- New Season detection
-- Trailer detection
-- Release Date detection
-- New Volume detection
-- Cast / Staff detection
-- New Visual detection
-- Opening / Ending detection
-- Adaptation detection
-- Announcement detection
-- Delay / Hiatus detection
-- Ending detection
-- Anime / manga / novel name extraction
-- Short RSS context
-- HTML cleanup
-- HTML entity cleanup
-- RSS image extraction
-- Website `og:image` fallback
-- Cross-feed duplicate detection
-- Persistent article history
-- First-run protection
-- Maximum posts per cycle
-- Optional Discord role mention
-- Test mode
-
----
-
-# Installation
-
-## 1. Create virtual environment
-
-Windows:
-
-    python -m venv .venv
-
-Activate:
-
-    .venv\Scripts\activate
-
-Linux/macOS:
-
-    python3 -m venv .venv
-
-    source .venv/bin/activate
-
----
-
-# 2. Install packages
-
-    pip install -r requirements.txt
-
----
-
-# 3. Configure Discord
-
-Create a webhook in your Discord server:
-
-Server Settings
-→ Integrations
-→ Webhooks
-→ New Webhook
-
-Select your `#anime-news` channel.
-
-Copy the webhook URL.
-
-Create a `.env` file:
-
-    DISCORD_WEBHOOK_URL=YOUR_WEBHOOK_URL
-
-Do NOT publish your webhook URL.
-
----
-
-# 4. Test the bot
-
-Run:
-
-    python bot.py --test
-
-This sends the latest article from each of the
-four RSS feeds.
-
-You should receive up to four test messages.
-
----
-
-# 5. Start normal mode
-
-Run:
-
-    python bot.py
-
-The first normal run will seed existing RSS articles.
-
-It will NOT dump the existing RSS backlog into Discord.
-
-After that, the bot checks for new articles every 15 minutes.
-
----
-
-# Posting limit
-
-The default maximum is:
-
-    MAX_POSTS_PER_CYCLE = 3
-
-This means a maximum of three new articles can be posted
-during a single RSS check.
-
-If you want two:
-
-    MAX_POSTS_PER_CYCLE = 2
-
-If you want five:
-
-    MAX_POSTS_PER_CYCLE = 5
-
----
-
-# RSS check interval
-
-Default:
-
-    CHECK_INTERVAL_SECONDS = 15 * 60
-
-This means every 15 minutes.
-
-For 30 minutes:
-
-    CHECK_INTERVAL_SECONDS = 30 * 60
-
-For 1 hour:
-
-    CHECK_INTERVAL_SECONDS = 60 * 60
-
----
-
-# Feeds
-
-The bot currently uses:
-
-1. Anime News Network
-2. Crunchyroll News
-3. MyAnimeList
-4. Anime Corner
-
-Edit `feeds.json` if you want to add or remove feeds.
-
----
-
-# Discord message design
-
-Each message attempts to contain:
-
-- Anime / Manga / Novel name
-- Media type
-- News topic
-- Short context
-- Article image
-- Source
-- Publication timestamp
-- Clickable article title
-- Random embed color
-
-Example:
-
-    The Apothecary Diaries
-
-    Anime • New Episode
-
-    The series revealed its creditless opening
-    ahead of today's premiere.
-
-    Source: Anime Corner
-    Type: Anime
-
-    [article image]
-
----
-
-# Duplicate protection
-
-The bot checks:
-
-- Article URL
-- RSS GUID
-- Similar article titles
-
-This helps prevent the same story from multiple RSS feeds
-from being posted repeatedly.
-
----
-
-# State
-
-`posted.json` stores previously processed articles.
-
-Do not delete it unless you intentionally want to reset
-the bot's article history.
-
-If you delete `posted.json`, the bot will treat the next
-run as a fresh installation.
-
----
-
-# Security
-
-Never publish:
-
-    .env
-
-Never publish:
-
-    DISCORD_WEBHOOK_URL
-
-Never send your Discord webhook URL to other people.
-
-The `.gitignore` file already excludes `.env`.
-
----
-
-# Stop the bot
-
-Press:
-
-    CTRL + C
-
----
-
-# Run again
-
-    python bot.py
+A small Python bot that reads anime / manga / light-novel news from RSS feeds and posts
+compact, de-duplicated Discord embeds through a webhook. No database, no framework.
+
+## Setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env             # then paste your webhook URL into .env
+python bot.py --test             # checks config + feeds, prints a sample embed (sends nothing)
+python bot.py --dry-run          # full cycle, prints what WOULD be posted
+python bot.py                    # run continuously
+```
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `python bot.py` | Run forever (checks every `CHECK_INTERVAL_MINUTES`, default 15) |
+| `python bot.py --once` | One cycle, then exit (for cron / schedulers) |
+| `python bot.py --dry-run` | One cycle, prints embeds, posts and saves nothing |
+| `python bot.py --test` | Config, feed and sample-embed check. Never posts. |
+| `python bot.py --test --send` | Same, and sends one sample embed |
+| `python bot.py --test-media` | Anime/Manga/Novel classification test (known cases + real feeds) |
+| `python bot.py --test-duplicates` | Cross-source duplicate test (known cases + real feeds) |
+
+## First run
+
+On the first normal run the bot **seeds** `posted.json` with everything currently in the
+feeds and posts nothing. Only articles published afterwards are posted. Set
+`FIRST_RUN_POST_LATEST=2` if you want the newest 2 posted immediately.
+
+## How it works
+
+1. **Fetch** every feed independently. A dead feed, timeout, invalid XML or a Cloudflare
+   "Just a moment…" page is logged and skipped; the others continue. Cloudflare is never bypassed.
+2. **Clean** HTML, entities, tracking parameters (`utm_*`, `fbclid`, …).
+3. **Classify** with scores: Anime / Manga / Novel / Other. Source-medium words ("Light Novel X
+   Gets TV Anime") don't override the real news event. "Graphic/visual novel" → Other.
+4. **Extract** the work's name, the primary event (priority-ordered), a 1–3 sentence factual
+   context built from the headline/description, and an image.
+5. **Filter** against `posted.json`, then **cluster** same-story articles across sources using
+   entity similarity + title similarity + event overlap (+ chapter/episode/season numbers, which
+   keep "Chapter 1170" and "Chapter 1171" apart). The best source/image wins.
+6. **Rank**, then post at most `MAX_POSTS_PER_CYCLE` (3), and at most one story per franchise
+   per cycle. Unposted articles are *not* remembered, so they stay eligible next cycle.
+7. **Remember** the posted story and every other source's version of it.
+
+Embed images are verified before use (and Open Graph is tried if the feed has none).
+If an image fails, the embed is sent without it.
+
+## Configuration
+
+- **Feeds:** edit `RSS_FEEDS` at the top of `bot.py`. Order = priority when sources overlap.
+  Feed URLs change over time. Run `python bot.py --test` to confirm each one works from your
+  server, and replace any that report a problem.
+- **Thresholds:** `SAME_STORY_SCORE`, `CONTEXT_SCORE`, `SAME_SOURCE_SCORE` in `bot.py`.
+- **Events / media signals:** `EVENT_RULES`, `REVEAL_ITEMS`, `*_SIGNALS` tables in `bot.py`.
+  Add a known miss to `MEDIA_TEST_CASES` / `DUPLICATE_TEST_CASES` and re-run the tests.
+
+## Running 24/7
+
+systemd (Linux):
+
+```ini
+# /etc/systemd/system/anime-news.service
+[Unit]
+Description=Anime News Discord bot
+After=network-online.target
+
+[Service]
+WorkingDirectory=/path/to/Discord-Webhook
+ExecStart=/path/to/Discord-Webhook/.venv/bin/python bot.py
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Or use cron with `--once`: `*/15 * * * * cd /path/to/Discord-Webhook && .venv/bin/python bot.py --once`.
+
+## Security
+
+- The webhook URL lives only in `.env` (git-ignored) and is redacted from logs.
+- If a webhook is ever exposed, delete it in Discord and create a new one immediately.
+- If you committed `.env` or `posted.json` by mistake: `git rm --cached .env posted.json`,
+  commit, and rotate the webhook.
+- Messages never use `@everyone`/`@here`. A role is pinged only if `DISCORD_ROLE_ID` is set,
+  and only on the first post of a cycle.
+
+## Files
+
+```
+bot.py            the whole application
+requirements.txt  feedparser, requests, python-dotenv, beautifulsoup4
+.env.example      template for .env (copy it; never commit .env)
+.gitignore        .env, posted.json, __pycache__/, *.pyc
+posted.json       created automatically (state)
+```
